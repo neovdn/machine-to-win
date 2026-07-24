@@ -1,0 +1,25 @@
+# File dan folder yang TIDAK perlu masuk ke version control (git)
+
+# File konfigurasi lokal (berisi info sensitif)
+.env
+
+# Folder data sementara
+data/
+
+# Folder cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Folder virtual environment Python
+venv/
+env/
+.venv/
+
+# Folder output IDE
+.vscode/
+.idea/
+
+# File log sementara
+*.log

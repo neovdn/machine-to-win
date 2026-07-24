@@ -1,0 +1,32 @@
+# =============================================================================
+# XAUUSD Trading Analysis System — Dependencies
+# Python 3.10.6+
+# =============================================================================
+
+# Koneksi ke MetaTrader 5 desktop
+# Versi 5.0.5735+ sudah kompatibel dengan numpy 2.x
+MetaTrader5==5.0.5735
+
+# Olah data candle jadi DataFrame (tabel data)
+pandas==2.2.2
+
+# Kalkulasi numerik (dipakai oleh pandas & indikator nanti)
+# Tidak di-pin ke versi spesifik agar kompatibel dengan library lain di sistem
+numpy>=2.0.0
+
+# Baca variabel konfigurasi dari file .env
+python-dotenv==1.0.1
+
+# Tampilkan DataFrame sebagai tabel rapi di terminal
+tabulate==0.9.0
+
+# Kalkulasi indikator teknikal (EMA, RSI, dll)
+# CATATAN: pandas-ta tidak support Python 3.10 via PyPI (butuh Python 3.12+)
+# Sebagai gantinya, kita pakai library 'ta' yang support Python 3.10+
+# EMA dihitung langsung via pandas .ewm() (identik dengan MT5)
+# RSI dihitung via ta.momentum.RSIIndicator (Wilder's Smoothing, identik MT5)
+ta==0.11.0
+
+# Web framework ringan untuk UI (Step 5)
+# Flask adalah server mini yang menghubungkan Python backend dengan browser
+Flask==3.0.3

@@ -1,0 +1,3 @@
+# engine/__init__.py
+# Menjadikan folder 'engine' sebagai Python package
+# sehingga bisa di-import dari file lain dengan: from engine.data_fetcher import ...

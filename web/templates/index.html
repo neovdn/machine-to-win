@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Mesin analisis trading rule-based untuk XAUUSD timeframe M5. Memberikan keputusan entry BUY/SELL/WAIT beserta SL, TP, dan RRR." />
+  <title>Machine to Win — Analisis XAUUSD M5</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+
+<body>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="header-brand">
+        <div class="brand-icon">
+          <!-- Logo Lightning SVG -->
+          <svg class="brand-logo-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1 class="brand-title">Machine to Win</h1>
+          <span class="brand-sub">Rule-Based Trading Analysis Engine</span>
+        </div>
+      </div>
+      <div class="header-meta">
+        <div class="meta-badge">
+          <span class="meta-dot"></span>
+          XAUUSD
+        </div>
+        <div class="meta-badge">M5</div>
+        <div class="meta-badge">Rule-Based</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-content">
+
+    <section class="trigger-section">
+      <form action="/analyze" method="post" id="analyze-form">
+        <button type="submit" class="btn-analyze" id="btn-analyze">
+          <!-- Search Icon SVG -->
+          <svg class="search-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <!-- Spinner SVG (hidden by default) -->
+          <svg class="loading-spinner-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:none; width:20px; height:20px;">
+            <line x1="12" y1="2" x2="12" y2="6"></line>
+            <line x1="12" y1="18" x2="12" y2="22"></line>
+            <line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line>
+            <line x1="16.24" y1="16.24" x2="19.07" y2="19.07"></line>
+            <line x1="2" y1="12" x2="6" y2="12"></line>
+            <line x1="18" y1="12" x2="22" y2="12"></line>
+            <line x1="4.93" y1="19.07" x2="7.76" y2="16.24"></line>
+            <line x1="16.24" y1="7.76" x2="19.07" y2="4.93"></line>
+          </svg>
+          <div class="btn-analyze-content">
+            <span class="btn-label">Analisis Sekarang</span>
+            <span class="btn-sub">XAUUSD &middot; M5 &middot; Real-time</span>
+          </div>
+        </button>
+      </form>
+      <p class="trigger-note">
+        Pastikan MetaTrader 5 sudah terbuka dan login sebelum klik tombol.
+      </p>
+    </section>
+
+    {% if error %}
+    <section class="section-error" role="alert">
+      <div class="error-card">
+        <!-- Error Octagon SVG -->
+        <svg class="error-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="7.86 2 16.14 2 22 7.86 22 16.14 16.14 22 7.86 22 2 16.14 2 7.86 7.86 2"></polygon>
+          <line x1="12" y1="8" x2="12" y2="12"></line>
+          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+        </svg>
+        <div class="error-body">
+          <h2 class="error-title">Analisis Gagal</h2>
+          <p class="error-msg">{{ error }}</p>
+        </div>
+      </div>
+    </section>
+    {% endif %}
+
+    {% if result %}
+
+    <div class="eval-timestamp-wrapper">
+      <!-- Calendar Icon SVG -->
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+        <line x1="16" y1="2" x2="16" y2="6"></line>
+        <line x1="8" y1="2" x2="8" y2="6"></line>
+        <line x1="3" y1="10" x2="21" y2="10"></line>
+      </svg>
+      <span class="eval-timestamp">Dievaluasi pada: <strong>{{ result.waktu }}</strong></span>
+    </div>
+
+    {% if result.keputusan == 'BUY' %}
+      {% set decision_class = 'decision-card decision-buy' %}
+      {% set decision_sub = 'Konfirmasi LONG terpenuhi' %}
+      {% set decision_svg = '<svg class="decision-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="17" x2="17" y2="7"></line><polyline points="7 7 17 7 17 17"></polyline></svg>' %}
+    {% elif result.keputusan == 'SELL' %}
+      {% set decision_class = 'decision-card decision-sell' %}
+      {% set decision_sub = 'Konfirmasi SHORT terpenuhi' %}
+      {% set decision_svg = '<svg class="decision-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="7" x2="17" y2="17"></line><polyline points="17 7 17 17 7 17"></polyline></svg>' %}
+    {% else %}
+      {% set decision_class = 'decision-card decision-wait' %}
+      {% set decision_sub = 'Kondisi entry belum terpenuhi' %}
+      {% set decision_svg = '<svg class="decision-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>' %}
+    {% endif %}
+
+    <section class="section-decision">
+      <div class="{{ decision_class }}">
+        <div class="decision-left">
+          <div class="decision-icon-container">
+            {{ decision_svg | safe }}
+          </div>
+          <div class="decision-details">
+            <span class="decision-label">Keputusan Akhir</span>
+            <div class="decision-main">
+              <span class="decision-word">{{ result.keputusan }}</span>
+              {% if result.arah %}
+              <span class="decision-direction">/ {{ result.arah }}</span>
+              {% endif %}
+            </div>
+            <span class="decision-sub">{{ decision_sub }}</span>
+          </div>
+        </div>
+        <div class="decision-right">
+          <div class="decision-confirm">
+            Kondisi Terpenuhi: <strong>{{ result.konfirmasi.terpenuhi }} / {{ result.konfirmasi.dibutuhkan }}</strong>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="grid-two">
+
+      <section class="card" id="card-signals">
+        <div class="card-header">
+          <!-- Activity/Signals SVG Icon -->
+          <svg class="card-header-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
+          </svg>
+          <h2 class="card-title">Sinyal Market Terkini</h2>
+        </div>
+        <div class="card-body">
+          <div class="signal-grid">
+
+            <div class="signal-item">
+              <div class="signal-header-row">
+                <span class="signal-label">Harga Close</span>
+                <svg class="signal-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
+              </div>
+              <span class="signal-value signal-price">${{ result.signals.close | round(2) }}</span>
+            </div>
+
+            <div class="signal-item">
+              <div class="signal-header-row">
+                <span class="signal-label">Trend</span>
+                <!-- Compass Icon -->
+                <svg class="signal-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"></polygon></svg>
+              </div>
+              {% if result.signals.trend == 'UPTREND' %}
+                {% set trend_class = 'signal-value signal-up' %}
+                {% set trend_text = 'UPTREND' %}
+                {% set trend_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px; display: inline; vertical-align: middle; margin-right: 4px;"><line x1="7" y1="17" x2="17" y2="7"></line><polyline points="7 7 17 7 17 17"></polyline></svg>' %}
+              {% elif result.signals.trend == 'DOWNTREND' %}
+                {% set trend_class = 'signal-value signal-down' %}
+                {% set trend_text = 'DOWNTREND' %}
+                {% set trend_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px; display: inline; vertical-align: middle; margin-right: 4px;"><line x1="7" y1="7" x2="17" y2="17"></line><polyline points="17 7 17 17 7 17"></polyline></svg>' %}
+              {% else %}
+                {% set trend_class = 'signal-value signal-neutral' %}
+                {% set trend_text = 'SIDEWAYS' %}
+                {% set trend_svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 14px; height: 14px; display: inline; vertical-align: middle; margin-right: 4px;"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>' %}
+              {% endif %}
+              <span class="{{ trend_class }}">{{ trend_svg | safe }}{{ trend_text }}</span>
+            </div>
+
+            <div class="signal-item">
+              <div class="signal-header-row">
+                <span class="signal-label">EMA 9 (Cepat)</span>
+                <span class="condition-tag">EMA Fast</span>
+              </div>
+              <span class="signal-value mono">${{ result.signals.ema_9 | round(2) }}</span>
+            </div>
+
+            <div class="signal-item">
+              <div class="signal-header-row">
+                <span class="signal-label">EMA 21 (Lambat)</span>
+                <span class="condition-tag">EMA Slow</span>
+              </div>
+              <span class="signal-value mono">${{ result.signals.ema_21 | round(2) }}</span>
+            </div>
+
+            <div class="signal-item">
+              <div class="signal-header-row">
+                <span class="signal-label">RSI 14</span>
+                <!-- Gauge Icon -->
+                <svg class="signal-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path></svg>
+              </div>
+              {% if result.signals.rsi_14 > 70 %}
+                {% set rsi_class = 'signal-value signal-down' %}
+                {% set rsi_zone = 'Overbought' %}
+              {% elif result.signals.rsi_14 < 30 %}
+                {% set rsi_class = 'signal-value signal-up' %}
+                {% set rsi_zone = 'Oversold' %}
+              {% else %}
+                {% set rsi_class = 'signal-value signal-neutral' %}
+                {% set rsi_zone = 'Netral' %}
+              {% endif %}
+              <span class="{{ rsi_class }}">{{ result.signals.rsi_14 | round(1) }} <span style="font-size: 0.72rem; opacity: 0.85;">({{ rsi_zone }})</span></span>
+            </div>
+
+            <div class="signal-item">
+              <div class="signal-header-row">
+                <span class="signal-label">EMA Gap %</span>
+                <span class="condition-tag">Spread</span>
+              </div>
+              {% if result.signals.ema_gap_pct > 0 %}
+                {% set gap_class = 'signal-value mono signal-up' %}
+                {% set gap_prefix = '+' %}
+              {% elif result.signals.ema_gap_pct < 0 %}
+                {% set gap_class = 'signal-value mono signal-down' %}
+                {% set gap_prefix = '' %}
+              {% else %}
+                {% set gap_class = 'signal-value mono signal-neutral' %}
+                {% set gap_prefix = '' %}
+              {% endif %}
+              <span class="{{ gap_class }}">{{ gap_prefix }}{{ result.signals.ema_gap_pct }}%</span>
+            </div>
+
+          </div>
+        </div>
+      </section>
+
+      <section class="card" id="card-conditions">
+        <div class="card-header">
+          <!-- Clipboard Checklist SVG Icon -->
+          <svg class="card-header-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+            <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
+          </svg>
+          <h2 class="card-title">Breakdown Kondisi</h2>
+        </div>
+        <div class="card-body">
+
+          <div class="conditions-list">
+            {% for kondisi in result.kondisi %}
+              {% if kondisi.terpenuhi %}
+                {% set cond_class = 'condition-item condition-ok' %}
+                {% set cond_svg = '<svg class="status-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>' %}
+              {% else %}
+                {% set cond_class = 'condition-item condition-fail' %}
+                {% set cond_svg = '<svg class="status-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>' %}
+              {% endif %}
+              
+              {% if kondisi.tipe == 'filter' %}
+                {% set cond_tag = 'Filter/Veto' %}
+              {% else %}
+                {% set cond_tag = 'Kondisi Entry' %}
+              {% endif %}
+              <div class="{{ cond_class }}">
+                <div class="condition-status">
+                  {{ cond_svg | safe }}
+                </div>
+                <div class="condition-content">
+                  <div class="condition-name">
+                    {{ kondisi.nama }}
+                    <span class="condition-tag">{{ cond_tag }}</span>
+                  </div>
+                  <div class="condition-desc">{{ kondisi.keterangan }}</div>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+
+          {% if result.alasan_entry %}
+          <div class="reason-block reason-entry">
+            <div class="reason-header-row">
+              <svg class="reason-header-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+              <span>Alasan Entry Terpenuhi:</span>
+            </div>
+            {% for alasan in result.alasan_entry %}
+            <div class="reason-item">{{ alasan }}</div>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          {% if result.alasan_wait %}
+          <div class="reason-block reason-wait">
+            <div class="reason-header-row">
+              <svg class="reason-header-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+              <span>Alasan Menunggu (Wait):</span>
+            </div>
+            {% for alasan in result.alasan_wait %}
+            <div class="reason-item">{{ alasan }}</div>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+        </div>
+      </section>
+
+    </div>
+
+    {% if result.risk and result.risk.valid %}
+      {% if result.keputusan == 'BUY' %}
+        {% set risk_badge_class = 'card-badge badge-buy' %}
+      {% else %}
+        {% set risk_badge_class = 'card-badge badge-sell' %}
+      {% endif %}
+
+      <section class="card card-risk" id="card-risk">
+        <div class="card-header">
+          <!-- Shield Check SVG Icon -->
+          <svg class="card-header-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path>
+            <polyline points="9 11 11 13 15 9"></polyline>
+          </svg>
+          <h2 class="card-title">Setup Manajemen Risiko</h2>
+          <span class="{{ risk_badge_class }}">{{ result.keputusan }} {{ result.arah }}</span>
+        </div>
+        
+        <div class="card-body">
+
+          <!-- Trade Target Flow Layout -->
+          <div class="risk-visual-wrapper">
+            <div class="risk-level-flow">
+              {% if result.keputusan == 'BUY' %}
+                <!-- Stop Loss (Left) -->
+                <div class="risk-block risk-block-sl">
+                  <div class="risk-block-label-wrapper">
+                    <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path></svg>
+                    <span class="risk-block-label">Stop Loss (SL)</span>
+                  </div>
+                  <div class="risk-block-price">${{ result.risk.sl }}</div>
+                  <div class="risk-block-note">-${{ result.risk.jarak_sl }} dari entry</div>
+                </div>
+
+                <!-- Entry Price (Center) -->
+                <div class="risk-block risk-block-entry">
+                  <div class="risk-block-label-wrapper">
+                    <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 14 14"></polyline></svg>
+                    <span class="risk-block-label">Entry Price</span>
+                  </div>
+                  <div class="risk-block-price">${{ result.risk.entry }}</div>
+                  <div class="risk-block-note">Monitored Close</div>
+                </div>
+
+                <!-- Take Profit (Right) -->
+                <div class="risk-block risk-block-tp">
+                  <div class="risk-block-label-wrapper">
+                    <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="17" x2="17" y2="7"></line><polyline points="7 7 17 7 17 17"></polyline></svg>
+                    <span class="risk-block-label">Take Profit (TP)</span>
+                  </div>
+                  <div class="risk-block-price">${{ result.risk.tp }}</div>
+                  <div class="risk-block-note">+${{ result.risk.jarak_tp }} dari entry</div>
+                </div>
+              {% else %}
+                <!-- For SELL: Take Profit is lower than entry, so TP (Left) <- Entry (Center) <- SL (Right) -->
+                <!-- Take Profit (Left) -->
+                <div class="risk-block risk-block-tp">
+                  <div class="risk-block-label-wrapper">
+                    <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="7" y1="7" x2="17" y2="17"></line><polyline points="17 7 17 17 7 17"></polyline></svg>
+                    <span class="risk-block-label">Take Profit (TP)</span>
+                  </div>
+                  <div class="risk-block-price">${{ result.risk.tp }}</div>
+                  <div class="risk-block-note">+${{ result.risk.jarak_tp }} dari entry</div>
+                </div>
+
+                <!-- Entry Price (Center) -->
+                <div class="risk-block risk-block-entry">
+                  <div class="risk-block-label-wrapper">
+                    <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 14 14"></polyline></svg>
+                    <span class="risk-block-label">Entry Price</span>
+                  </div>
+                  <div class="risk-block-price">${{ result.risk.entry }}</div>
+                  <div class="risk-block-note">Monitored Close</div>
+                </div>
+
+                <!-- Stop Loss (Right) -->
+                <div class="risk-block risk-block-sl">
+                  <div class="risk-block-label-wrapper">
+                    <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path></svg>
+                    <span class="risk-block-label">Stop Loss (SL)</span>
+                  </div>
+                  <div class="risk-block-price">${{ result.risk.sl }}</div>
+                  <div class="risk-block-note">-${{ result.risk.jarak_sl }} dari entry</div>
+                </div>
+              {% endif %}
+            </div>
+          </div>
+
+          <!-- Risk Stats row -->
+          <div class="risk-stats-row">
+            
+            <div class="risk-stat-card">
+              <div class="risk-stat-label-row">
+                <svg class="risk-stat-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
+                <span class="risk-stat-label">Risk/Reward Ratio</span>
+              </div>
+              <span class="risk-stat-value rrr-highlight">{{ result.risk.rrr }}:1</span>
+            </div>
+
+            <div class="risk-stat-card">
+              <div class="risk-stat-label-row">
+                <svg class="risk-stat-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+                <span class="risk-stat-label">Metode SL</span>
+              </div>
+              {% if result.risk.sl_method == 'SWING' %}
+                <span class="method-pill method-swing">SWING HIGH/LOW</span>
+              {% else %}
+                <span class="method-pill method-atr">ATR-BASED</span>
+              {% endif %}
+            </div>
+
+            <div class="risk-stat-card">
+              <div class="risk-stat-label-row">
+                <svg class="risk-stat-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>
+                <span class="risk-stat-label">ATR (14)</span>
+              </div>
+              <span class="risk-stat-value mono">${{ result.risk.atr_value }}</span>
+            </div>
+
+            {% if result.risk.sl_swing_raw %}
+            <div class="risk-stat-card">
+              <div class="risk-stat-label-row">
+                <svg class="risk-stat-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+                <span class="risk-stat-label">Swing Price Level</span>
+              </div>
+              <span class="risk-stat-value mono">${{ result.risk.sl_swing_raw }}</span>
+            </div>
+            {% endif %}
+
+          </div>
+
+          <!-- Bottom Audit Bar -->
+          <div class="risk-audit-bar">
+            <svg class="risk-audit-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+            <div class="risk-audit-content">
+              <span class="risk-audit-label">Log Detail SL:</span>
+              <span class="risk-audit-text">{{ result.risk.pesan }}</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+    {% endif %}
+
+    {% endif %}
+
+  </main>
+
+  <footer class="site-footer">
+    <p>Machine to Win &middot; XAUUSD M5 Analysis Engine &middot; Rule-Based, No AI</p>
+  </footer>
+
+  <script>
+    var form = document.getElementById("analyze-form");
+    var btn  = document.getElementById("btn-analyze");
+    if (form && btn) {
+      form.addEventListener("submit", function () {
+        btn.classList.add("btn-loading");
+        
+        var searchIcon = btn.querySelector(".search-icon-svg");
+        var loadingSpinner = btn.querySelector(".loading-spinner-svg");
+        if (searchIcon) searchIcon.style.display = "none";
+        if (loadingSpinner) loadingSpinner.style.display = "inline-block";
+
+        btn.querySelector(".btn-label").textContent = "Menganalisis...";
+        btn.querySelector(".btn-sub").textContent   = "Menghubungkan ke MT5...";
+        btn.disabled = true;
+      });
+    }
+  </script>
+
+</body>
+</html>
