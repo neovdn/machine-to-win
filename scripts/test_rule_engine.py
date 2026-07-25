@@ -9,14 +9,19 @@ CARA PAKAI:
        python scripts/test_rule_engine.py
 
 OUTPUT YANG DITAMPILKAN:
-    1. Nilai indikator terbaru (close, EMA, RSI, trend)
+    1. Nilai indikator dari candle CLOSED terakhir (bukan candle yang sedang berjalan)
     2. Keputusan akhir (BUY / SELL / WAIT) beserta alasannya
     3. Breakdown tiap kondisi untuk audit
     4. Tabel simulasi skenario berbeda (untuk memastikan logika benar)
 
+CATA CANDLE CLOSED:
+    Sistem ini menganalisis candle yang sudah SELESAI terbentuk (closed).
+    Candle aktif yang sedang berjalan secara sengaja dilewati (start_pos=1).
+    Ini mencegah sinyal berubah-ubah (repainting) saat candle masih hidup.
+
 CARA MEMBANDINGKAN DENGAN ANALISIS MANUAL:
     - Buka chart XAUUSD M5 di MT5
-    - Perhatikan posisi EMA 9 vs EMA 21 dan nilai RSI
+    - Perhatikan posisi EMA 9 vs EMA 21 dan nilai RSI di candle KEDUA dari kanan
     - Bandingkan dengan keputusan yang muncul di sini
     - Jika keputusan berbeda dari analisis manual kamu, lihat bagian
       "breakdown kondisi" untuk tahu kondisi mana yang tidak terpenuhi
@@ -177,9 +182,9 @@ hasil = evaluate_entry(signals)
 # Tampilkan ringkasan indikator terbaru
 print()
 _garis()
-print("  📊  KONDISI MARKET TERBARU (INPUT KE RULE ENGINE)")
+print("  📊  KONDISI MARKET TERBARU (CANDLE CLOSED TERAKHIR)")
 _garis()
-print(f"  Waktu    : {signals['time']}")
+print(f"  Waktu    : {signals['time']}  ← ini waktu PEMBUKAAN candle closed terakhir")
 print(f"  Close    : {signals['close']:.2f}")
 print(f"  EMA 9    : {signals['ema_9']:.2f}")
 print(f"  EMA 21   : {signals['ema_21']:.2f}")

@@ -11,6 +11,22 @@ CARA KERJA:
 KENAPA TIDAK PERLU USERNAME/PASSWORD:
 Library MetaTrader5 di Windows bisa terhubung langsung ke proses MT5 yang
 sedang berjalan tanpa perlu autentikasi ulang — karena sudah login di desktop.
+
+JAMINAN CANDLE CLOSED:
+    Semua fungsi di modul ini HANYA mengembalikan candle yang sudah CLOSED
+    (selesai terbentuk). Candle yang sedang berjalan (belum closed) secara
+    SENGAJA dilewati dengan menggunakan start_pos=1 di copy_rates_from_pos.
+
+    KENAPA INI PENTING:
+        Candle yang belum closed memiliki high/low/close yang masih bisa
+        berubah setiap detik. Jika dipakai untuk menghitung indikator atau
+        membuat keputusan trading, hasilnya bisa "repainting" — keputusan
+        BUY/SELL yang muncul sekarang bisa berubah beberapa menit kemudian
+        ketika candle benar-benar menutup.
+
+    KONSEKUENSI DESAIN:
+        df.iloc[-1] di seluruh codebase = candle CLOSED terakhir.
+        Bukan candle yang sedang terbentuk.
 """
 
 import os
@@ -95,21 +111,33 @@ def get_candles(
     """
     Mengambil data candle historis dari MT5 dan mengembalikannya sebagai DataFrame.
 
+    JAMINAN PENTING:
+        Fungsi ini HANYA mengembalikan candle yang sudah CLOSED (selesai terbentuk).
+        Candle yang sedang berjalan (belum closed) secara sengaja dilewati.
+
+        Implementasi: copy_rates_from_pos(..., start_pos=1, ...) — angka 1 berarti
+        "mulai dari posisi 1 ke belakang", sehingga posisi 0 (candle aktif saat ini)
+        otomatis dilewati oleh MT5.
+
+        Konsekuensi: df.iloc[-1] di seluruh codebase = candle CLOSED terakhir.
+
     Parameter:
         symbol        : Nama instrumen (misal "XAUUSD"). Default dari .env
         timeframe_str : Timeframe sebagai string (misal "M5"). Default dari .env
-        count         : Jumlah candle yang diambil. Default dari .env
+        count         : Jumlah candle yang diambil (semuanya sudah closed).
+                        Default dari .env
 
     Return:
         pd.DataFrame dengan kolom: time, open, high, low, close, tick_volume
+        Semua baris adalah candle yang sudah closed.
         None jika terjadi error
 
     KOLOM PENJELASAN:
         time        : Waktu pembukaan candle (dalam format datetime)
         open        : Harga pembukaan candle
-        high        : Harga tertinggi dalam periode candle
-        low         : Harga terendah dalam periode candle
-        close       : Harga penutupan candle
+        high        : Harga tertinggi dalam periode candle (nilai FINAL, sudah closed)
+        low         : Harga terendah dalam periode candle (nilai FINAL, sudah closed)
+        close       : Harga penutupan candle (nilai FINAL, sudah closed)
         tick_volume : Jumlah tick (pergerakan harga) dalam periode candle
                       Di Forex/Gold, ini adalah volume proxy (bukan volume asli lot)
     """
@@ -127,7 +155,7 @@ def get_candles(
     # Konversi string timeframe ke integer konstanta MT5
     timeframe = TIMEFRAME_MAP[timeframe_str]
 
-    print(f"📊 Menarik {count} candle {symbol} {timeframe_str}...")
+    print(f"📊 Menarik {count} candle {symbol} {timeframe_str} (hanya yang closed)...")
 
     # ─────────────────────────────────────────────────────────────────
     # mt5.copy_rates_from_pos() — fungsi utama pengambilan data
@@ -135,12 +163,17 @@ def get_candles(
     # Parameter:
     #   symbol     : nama instrumen
     #   timeframe  : timeframe (integer konstanta MT5)
-    #   start_pos  : 0 = mulai dari candle TERBARU
-    #   count      : berapa banyak candle yang diambil ke belakang
+    #   start_pos  : 1 = mulai dari candle ke-1 (BUKAN candle aktif ke-0)
+    #                ↑ INI KUNCI FIX REPAINTING!
+    #                  start_pos=0 → candle yang sedang terbentuk (belum closed)
+    #                  start_pos=1 → candle closed pertama (selesai terbentuk)
+    #                  Dengan start_pos=1, candle aktif otomatis terlewati.
+    #   count      : berapa banyak candle closed yang diambil ke belakang
     #
     # Hasilnya adalah numpy structured array (seperti tabel)
+    # Semua baris adalah candle yang sudah CLOSED.
     # ─────────────────────────────────────────────────────────────────
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, count)
 
     # Cek apakah data berhasil ditarik
     if rates is None or len(rates) == 0:
@@ -174,7 +207,8 @@ def get_candles(
     # Bersihkan index: set waktu sebagai index agar mudah di-query berdasarkan waktu
     df = df.set_index("time")
 
-    print(f"✅ Data berhasil ditarik: {len(df)} candle")
+    print(f"✅ Data berhasil ditarik: {len(df)} candle (semua sudah closed)")
+    print(f"   Candle terbaru: {df.index[-1]}")
     return df
 
 

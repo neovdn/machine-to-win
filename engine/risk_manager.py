@@ -36,7 +36,22 @@ ATR_PERIOD        = 14    # Periode ATR (harus sama dengan yang di indicators.py
 ATR_MULTIPLIER    = 1.5   # SL minimum = 1.5 × ATR dari entry
 RRR_MIN_DEFAULT   = 2.0   # TP = entry ± (jarak_SL × RRR minimum)
 SWING_LOOKBACK    = 50    # Berapa candle ke belakang untuk cari swing
-SWING_WING        = 3     # Berapa candle kiri & kanan untuk konfirmasi swing
+SWING_WING        = 5     # Berapa candle kiri & kanan untuk konfirmasi swing
+                          # (diubah dari 3 → 5 setelah analisis data nyata)
+                          #
+                          # TRADE-OFF WING SIZE DI XAUUSD M5:
+                          #   wing=3 : window 35 menit. Banyak swing ditemukan tapi
+                          #            sebagian adalah noise — lembah/puncak kecil yang
+                          #            tidak terlihat jelas di chart manual.
+                          #   wing=5 : window 55 menit (~1 jam). Menyaring swing kecil
+                          #            yang terlalu mirip satu sama lain, tapi masih
+                          #            menemukan swing yang benar-benar terlihat di chart.
+                          #            SL yang dihasilkan lebih bermakna secara visual.
+                          #   wing=8 : window 85 menit. Terlalu ketat — bisa melewatkan
+                          #            swing yang jelas terlihat (misal 30 menit lalu)
+                          #            dan lebih sering fallback ke ATR.
+                          #
+                          # KESIMPULAN: wing=5 adalah sweet spot untuk M5 XAUUSD.
 SWING_BUFFER      = 0.50  # Buffer dollar di luar swing (agar SL tidak persis di level)
 
 
@@ -67,13 +82,18 @@ def find_nearest_swing(
               Low  ─ ─ ─ ┘
 
     CARA KERJA:
-        1. Ambil `lookback` candle terakhir (kecualikan candle paling akhir
-           karena bisa sedang terbentuk / belum closed sepenuhnya)
-        2. Cari candle yang low/high-nya adalah minimum/maksimum lokal
-        3. Kembalikan swing terdekat (yang paling baru) — iterate dari akhir
+        1. Ambil `lookback` candle terakhir dari DataFrame (sudah dijamin closed semua
+           karena get_candles() menggunakan start_pos=1).
+        2. Namun candle PALING AKHIR di window tetap dikecualikan karena alasan teknikal
+           swing: candle paling akhir tidak punya candle di sebelah kanannya, sehingga
+           tidak bisa memenuhi syarat "lebih rendah/tinggi dari wing candle di kanan".
+           Ini bukan karena belum closed, tapi karena keterbatasan definisi swing.
+        3. Cari candle yang low/high-nya adalah minimum/maksimum lokal
+        4. Kembalikan swing terdekat (yang paling baru) — iterate dari akhir
 
     Parameter:
         df       : DataFrame yang sudah punya kolom 'low' dan 'high'
+                   (semua candle sudah closed, jaminan dari get_candles())
         arah     : "BUY"  → cari swing LOW (untuk referensi SL di bawah entry)
                    "SELL" → cari swing HIGH (untuk referensi SL di atas entry)
         lookback : Jumlah candle ke belakang yang ditelusuri
@@ -91,7 +111,13 @@ def find_nearest_swing(
         return None
 
     # Ambil window data:
-    # - Kecualikan candle terakhir ([-1]) karena mungkin masih terbentuk
+    # - Kecualikan candle paling akhir ([-1]) karena alasan teknikal swing:
+    #   Sebuah candle bisa jadi swing HANYA jika ada `wing` candle di kiri
+    #   DAN kanan yang lebih tinggi/rendah. Candle terakhir di DataFrame
+    #   tidak punya candle di sebelah kanannya sama sekali, sehingga
+    #   tidak bisa memenuhi definisi swing.
+    #   (Bukan karena belum closed — data sudah dijamin closed semua dari
+    #   get_candles() dengan start_pos=1.)
     # - Ambil lebih banyak dari lookback agar candle di tepi window tetap
     #   punya cukup tetangga untuk validasi swing
     data = df.iloc[-(lookback + wing * 2):-1].copy()

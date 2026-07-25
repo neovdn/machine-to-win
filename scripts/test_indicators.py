@@ -8,6 +8,14 @@ CARA PAKAI:
     2. Jalankan dari root project:
        python scripts/test_indicators.py
 
+VALIDASI CANDLE CLOSED:
+    Script ini juga memverifikasi bahwa sistem menggunakan candle yang sudah
+    CLOSED, bukan candle yang sedang berjalan. Caranya:
+    - Tampilkan timestamp candle terbaru
+    - Hitung selisih vs waktu sekarang
+    - Jika selisih >= 5 menit (1 timeframe M5), berarti BENAR — sistem skip
+      candle aktif dan menggunakan candle closed terakhir.
+
 CARA MEMBANDINGKAN DENGAN MT5:
     1. Di MT5, buka chart XAUUSD M5
     2. Tambahkan EMA 9 dan EMA 21 (Insert → Indicators → Trend → Moving Average)
@@ -15,7 +23,9 @@ CARA MEMBANDINGKAN DENGAN MT5:
        - Period: 21, Method: Exponential, Apply to: Close
     3. Tambahkan RSI 14 (Insert → Indicators → Oscillators → RSI)
        - Period: 14
-    4. Bandingkan nilai yang muncul di sini dengan nilai di MT5 pada candle terakhir
+    4. Arahkan ke candle KEDUA dari kanan (bukan yang paling kanan!) —
+       karena yang paling kanan adalah candle aktif yang kita skip.
+    5. Bandingkan nilai yang muncul di sini dengan nilai di MT5 pada candle tersebut.
 
 KENAPA BISA SEDIKIT BERBEDA:
     Perbedaan kecil (< 0.5) di candle terakhir adalah NORMAL karena:
@@ -40,6 +50,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from engine.data_fetcher import initialize_mt5, get_candles, shutdown_mt5
 from engine.indicators import run_all_indicators, get_latest_signals
+import MetaTrader5 as mt5  # untuk ambil waktu broker sebagai referensi validasi
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,6 +80,14 @@ if df is None:
     shutdown_mt5()
     sys.exit(1)
 
+# Ambil waktu server broker SEBELUM shutdown — dipakai untuk validasi candle closed.
+# Kita ambil dari tick terbaru (mt5.symbol_info_tick) bukan datetime.now(),
+# karena broker bisa pakai timezone berbeda dari komputer (misalnya UTC+3).
+# Dengan pakai sumber yang sama (MT5), perbandingan selalu akurat.
+_tick = mt5.symbol_info_tick("XAUUSD")
+broker_now_unix = _tick.time  # detik (integer), timezone broker
+del _tick
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STEP 2: Hitung semua indikator
@@ -85,7 +104,7 @@ print("✅ Kalkulasi selesai!")
 
 print()
 print("=" * 65)
-print("  📋  10 CANDLE TERAKHIR + INDIKATOR")
+print("  📃  10 CANDLE TERAKHIR + INDIKATOR (semua sudah closed)")
 print("=" * 65)
 
 # Pilih kolom yang mau ditampilkan
@@ -109,18 +128,73 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4: Tampilkan ringkasan nilai terbaru (candle paling kanan di chart)
+# STEP 4: Tampilkan ringkasan nilai terbaru (candle closed terakhir)
 # ─────────────────────────────────────────────────────────────────────────────
 
 signals = get_latest_signals(df)
 
 print()
 print("=" * 65)
-print("  📊  KONDISI MARKET SAAT INI (CANDLE TERBARU)")
+print("  📊  KONDISI MARKET — CANDLE CLOSED TERAKHIR")
 print("=" * 65)
 print(f"  Waktu candle : {signals['time']}")
 print(f"  Close        : {signals['close']:.2f}")
 print()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDASI CANDLE CLOSED
+# Verifikasi bahwa candle terbaru bukan candle yang sedang berjalan.
+# Caranya: hitung selisih waktu antara candle terbaru dan waktu sekarang.
+# Untuk M5, candle yang sudah closed minimal berumur 5 menit dari waktu open-nya.
+# Jika selisih < 5 menit, berarti sistem mungkin masih pakai candle aktif.
+# ─────────────────────────────────────────────────────────────────────────────
+
+print("=" * 65)
+print("  ✅  VALIDASI: APAKAH SISTEM SUDAH SKIP CANDLE AKTIF?")
+print("=" * 65)
+
+# ── Cara kerja validasi ini ──────────────────────────────────────────────────
+# Masalah: broker MT5 menggunakan timezone server (UTC+3/EEST di musim panas,
+# UTC+2/EET di musim dingin). Timestamp candle dan tick KEDUANYA pakai
+# timezone yang sama, sehingga kita bisa bandingkan langsung tanpa
+# perlu tahu berapa offset-nya. Timezone-agnostic = selalu akurat.
+#
+# broker_now_unix : waktu sekarang versi broker (integer, detik)
+# candle open     : waktu pembukaan candle (integer, detik) → dari df.index
+# candle close    : candle open + 300 detik (5 menit × 60)
+#
+# Jika broker_now > candle_close → candle sudah CLOSED ✓
+# ─────────────────────────────────────────────────────────────────
+
+TF_SECONDS = 5 * 60  # timeframe M5 = 300 detik
+
+# Konversi timestamp candle (Pandas Timestamp) ke detik integer
+# .value = nanoseconds → bagi 1e9 = seconds
+candle_open_unix  = int(df.index[-1].value // 1_000_000_000)  # candle terakhir (closed)
+candle_close_unix = candle_open_unix + TF_SECONDS              # perkiraan waktu tutup
+
+# Selisih dalam detik (positif = sudah lewat, negatif = belum terjadi)
+sudah_closed_detik = broker_now_unix - candle_close_unix
+sudah_closed_menit = sudah_closed_detik / 60
+
+print(f"  Referensi waktu broker : unix = {broker_now_unix}")
+print(f"  Candle terbaru open    : unix = {candle_open_unix}")
+print(f"  Perkiraan candle close : unix = {candle_close_unix}  (open + {TF_SECONDS}s)")
+print(f"  Selisih (now - close)  : {sudah_closed_detik} detik  = {sudah_closed_menit:.1f} menit")
+print()
+
+if sudah_closed_detik > 0:
+    print(f"  ✅ TERBUKTI CLOSED! Candle terbaru sudah tutup {sudah_closed_menit:.1f} menit yang lalu.")
+    print(f"     Waktu broker sekarang ({broker_now_unix}) > waktu tutup candle ({candle_close_unix}).")
+    print(f"     Sistem TIDAK menganalisis candle yang sedang berjalan.")
+    print(f"     Keputusan trading tidak akan repainting.")
+elif sudah_closed_detik == 0:
+    print(f"  ✅ Candle baru saja closed (tepat di waktu tutupnya).")
+else:
+    print(f"  ⚠️  PERINGATAN: Candle terbaru belum closed ({abs(sudah_closed_menit):.1f} menit lagi).")
+    print(f"     Ini tidak normal jika start_pos=1 sudah diterapkan di get_candles().")
+    print(f"     Periksa data_fetcher.py.")
+
 print(f"  EMA 9        : {signals['ema_9']:.2f}")
 print(f"  EMA 21       : {signals['ema_21']:.2f}")
 print(f"  EMA Gap %    : {signals['ema_gap_pct']:+.4f}%")

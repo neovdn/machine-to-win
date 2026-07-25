@@ -9,13 +9,19 @@ CARA KERJA UMUM:
     berisi nilai indikator.
 
     Contoh alur pemakaian:
-        df = get_candles()           # ambil data dari MT5
+        df = get_candles()           # ambil data dari MT5 (semua sudah closed)
         df = calculate_ema(df)       # tambah kolom ema_9 dan ema_21
         df = calculate_rsi(df)       # tambah kolom rsi_14
         df = detect_trend(df)        # tambah kolom trend
 
-    Untuk melihat hasil terakhir (candle paling baru):
-        df.iloc[-1]                  # baris terakhir = candle terbaru
+    Untuk melihat hasil terakhir (candle paling baru yang sudah closed):
+        df.iloc[-1]                  # baris terakhir = candle CLOSED terakhir
+
+    CATATAN PENTING:
+        get_candles() menggunakan start_pos=1 di MT5, sehingga candle yang
+        sedang terbentuk (belum closed) TIDAK ADA di DataFrame ini.
+        df.iloc[-1] selalu = candle yang sudah selesai (closed), bukan
+        candle yang masih berjalan. Ini mencegah masalah "repainting signal".
 
 CATATAN LIBRARY:
     Kita TIDAK pakai pandas-ta karena tidak support Python 3.10 di PyPI.
@@ -282,8 +288,12 @@ def run_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     Fungsi ini memanggil calculate_ema → calculate_rsi → detect_trend → calculate_atr
     secara berurutan. Urutan penting karena detect_trend butuh hasil EMA.
 
+    ASUMSI INPUT:
+        df yang diterima sudah berisi candle CLOSED semua (jaminan dari get_candles()).
+        Tidak perlu buang baris terakhir di sini karena data sudah bersih.
+
     Parameter:
-        df : DataFrame mentah dari get_candles()
+        df : DataFrame mentah dari get_candles() — semua baris sudah closed
 
     Return:
         DataFrame lengkap dengan semua kolom indikator:
@@ -298,9 +308,9 @@ def run_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         from engine.indicators import run_all_indicators
 
         initialize_mt5()
-        df = get_candles()
+        df = get_candles()           # hanya candle closed
         df = run_all_indicators(df)
-        print(df.iloc[-1])   # lihat nilai terkini semua indikator
+        print(df.iloc[-1])   # lihat nilai terkini dari candle closed terakhir
         shutdown_mt5()
     """
     df = calculate_ema(df, periods=[9, 21])
@@ -316,21 +326,29 @@ def run_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 def get_latest_signals(df: pd.DataFrame) -> dict:
     """
-    Mengekstrak nilai indikator terbaru dari candle terakhir sebagai dictionary.
+    Mengekstrak nilai indikator dari candle CLOSED terakhir sebagai dictionary.
+
+    "Candle CLOSED terakhir" = candle paling kanan di chart yang sudah selesai
+    terbentuk (high/low/close-nya sudah final, tidak akan berubah lagi).
+
+    KENAPA BUKAN CANDLE YANG SEDANG BERJALAN:
+        Data dari get_candles() sudah dijamin hanya berisi candle closed
+        (start_pos=1 di MT5). Jadi df.iloc[-1] secara otomatis = candle
+        closed terakhir — bukan candle yang sedang terbentuk.
 
     Fungsi ini berguna untuk:
     - Menampilkan ringkasan kondisi market saat ini
-    - Mengirim data ke rule_engine (Step 3 nanti)
+    - Mengirim data ke rule_engine
     - Logging dan debugging
 
     Parameter:
         df : DataFrame yang sudah melalui run_all_indicators()
 
     Return:
-        Dictionary berisi nilai-nilai terkini, contoh:
+        Dictionary berisi nilai-nilai dari candle closed terakhir, contoh:
         {
-            "time"        : Timestamp("2026-07-24 08:20:00+00:00"),
-            "close"       : 4029.26,
+            "time"        : Timestamp("2026-07-24 08:15:00+00:00"),  # waktu OPEN candle
+            "close"       : 4029.26,    # harga penutupan (FINAL)
             "ema_9"       : 4031.45,
             "ema_21"      : 4038.72,
             "rsi_14"      : 42.3,
@@ -341,7 +359,8 @@ def get_latest_signals(df: pd.DataFrame) -> dict:
     required = ["close", "ema_9", "ema_21", "rsi_14", "trend", "ema_gap_pct"]
     _check_dataframe(df, required_columns=required)
 
-    # iloc[-1] = ambil baris TERAKHIR (candle terbaru)
+    # iloc[-1] = ambil baris TERAKHIR = candle CLOSED terakhir
+    # (bukan candle yang sedang berjalan, karena get_candles() sudah skip itu)
     last = df.iloc[-1]
 
     return {
