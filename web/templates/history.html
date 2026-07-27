@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Histori Analisis & Log Transaksi XAUUSD M5 Trading Engine." />
+  <title>Histori Analisis • Machine to Win</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+
+<body>
+
+  <!-- Site Header -->
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="header-brand">
+        <div class="brand-icon">
+          <svg class="brand-logo-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <h1 class="brand-title">Machine to Win</h1>
+          <span class="brand-sub">Histori Analisis & Audit Decision Engine</span>
+        </div>
+      </div>
+      <div class="header-meta">
+        <a href="/" class="meta-badge highlight" style="text-decoration: none; cursor: pointer;">
+          ← Kembali ke Dashboard
+        </a>
+        <div class="meta-badge">SQLite Log</div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Content Layout -->
+  <main class="main-content">
+    <div class="history-container">
+
+      <div class="history-header">
+        <div>
+          <h2 class="history-title">📚 Log & Histori Evaluasi Trading</h2>
+          <p class="history-sub">Semua hasil evaluasi <code>evaluate_entry()</code> tersimpan otomatis di <code>data/history.db</code> untuk audit 100% transparan.</p>
+        </div>
+        <div class="history-stats">
+          <span class="stat-pill">Total Catatan: <strong>{{ history | length }}</strong></span>
+        </div>
+      </div>
+
+      {% if not history %}
+      <div class="history-empty">
+        <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+        <p>Belum ada histori analisis. Klik "Analisis Sekarang" di dashboard utama untuk membuat catatan pertama.</p>
+        <a href="/" class="btn-back">Buka Dashboard</a>
+      </div>
+      {% else %}
+
+      <div class="history-table-card">
+        <div class="table-responsive">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Waktu Evaluasi</th>
+                <th>Simbol</th>
+                <th>Harga Close</th>
+                <th>Keputusan</th>
+                <th>Quality Score</th>
+                <th>Level SL / TP</th>
+                <th>RRR</th>
+                <th>Status Outcome</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for item in history %}
+              <tr>
+                <td><code class="code-id">#{{ item.id }}</code></td>
+                <td class="col-time">{{ item.timestamp | replace('T', ' ') | truncate(20, True, '') }}</td>
+                <td><span class="symbol-tag">{{ item.symbol }} {{ item.timeframe }}</span></td>
+                <td class="mono-text">${{ "%.2f"|format(item.close_price) }}</td>
+                <td>
+                  {% if item.decision == 'BUY' %}
+                    <span class="decision-tag tag-buy">BUY {{ item.arah or '' }}</span>
+                  {% elif item.decision == 'SELL' %}
+                    <span class="decision-tag tag-sell">SELL {{ item.arah or '' }}</span>
+                  {% else %}
+                    <span class="decision-tag tag-wait">WAIT</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if item.setup_quality == 'STRONG' %}
+                    <span class="quality-tag tag-strong">STRONG ({{ item.quality_score }}/8)</span>
+                  {% elif item.setup_quality == 'MODERATE' %}
+                    <span class="quality-tag tag-moderate">MODERATE ({{ item.quality_score }}/8)</span>
+                  {% else %}
+                    <span class="quality-tag tag-weak">WEAK ({{ item.quality_score }}/8)</span>
+                  {% endif %}
+                </td>
+                <td class="mono-text">
+                  {% if item.sl_price and item.tp_price %}
+                    <div class="sltp-group">
+                      <span class="sl-text">SL: ${{ "%.2f"|format(item.sl_price) }}</span>
+                      <span class="tp-text">TP: ${{ "%.2f"|format(item.tp_price) }}</span>
+                    </div>
+                  {% else %}
+                    <span class="text-muted">-</span>
+                  {% endif %}
+                </td>
+                <td class="mono-text">
+                  {% if item.rrr %}
+                    <span class="rrr-badge">{{ "%.2f"|format(item.rrr) }}R</span>
+                  {% else %}
+                    <span class="text-muted">-</span>
+                  {% endif %}
+                </td>
+                <td>
+                  <select class="outcome-select" data-id="{{ item.id }}" onchange="updateOutcome(this)">
+                    <option value="PENDING" {% if item.outcome == 'PENDING' %}selected{% endif %}>⏳ PENDING</option>
+                    <option value="WIN" {% if item.outcome == 'WIN' %}selected{% endif %}>✅ WIN (TP Hit)</option>
+                    <option value="LOSS" {% if item.outcome == 'LOSS' %}selected{% endif %}>❌ LOSS (SL Hit)</option>
+                    <option value="EXPIRED" {% if item.outcome == 'EXPIRED' %}selected{% endif %}>⏰ EXPIRED</option>
+                    <option value="MANUAL_CLOSE" {% if item.outcome == 'MANUAL_CLOSE' %}selected{% endif %}>✋ MANUAL CLOSE</option>
+                  </select>
+                </td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {% endif %}
+
+    </div>
+  </main>
+
+  <script>
+    async function updateOutcome(selectEl) {
+      const recordId = selectEl.getAttribute('data-id');
+      const outcome = selectEl.value;
+
+      selectEl.disabled = true;
+      try {
+        const response = await fetch('/api/history/outcome', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ record_id: recordId, outcome: outcome })
+        });
+        const result = await response.json();
+        if (result.success) {
+          selectEl.style.borderColor = '#10b981';
+          setTimeout(() => { selectEl.style.borderColor = ''; }, 1500);
+        } else {
+          alert('Gagal update outcome: ' + (result.error || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('Gagal menghubungi server: ' + err);
+      } finally {
+        selectEl.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>

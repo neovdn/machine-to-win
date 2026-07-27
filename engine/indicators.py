@@ -396,7 +396,7 @@ def get_latest_signals(df: pd.DataFrame) -> dict:
     # (bukan candle yang sedang berjalan, karena get_candles() sudah skip itu)
     last = df.iloc[-1]
 
-    return {
+    res = {
         "time"        : df.index[-1],           # waktu candle terbaru
         "close"       : round(float(last["close"]),       2),
         "ema_9"       : round(float(last["ema_9"]),       2),
@@ -405,6 +405,23 @@ def get_latest_signals(df: pd.DataFrame) -> dict:
         "trend"       : str(last["trend"]),
         "ema_gap_pct" : round(float(last["ema_gap_pct"]), 4),
     }
+
+    if "atr_14" in df.columns and not pd.isna(last["atr_14"]):
+        res["atr_14"] = round(float(last["atr_14"]), 2)
+
+    try:
+        from engine.risk_manager import find_nearest_swing
+        sw_low  = find_nearest_swing(df, "BUY")
+        sw_high = find_nearest_swing(df, "SELL")
+        if sw_low is not None:
+            res["swing_low"] = round(float(sw_low), 2)
+        if sw_high is not None:
+            res["swing_high"] = round(float(sw_high), 2)
+    except Exception:
+        pass
+
+    return res
+
 
 
 # =============================================================================

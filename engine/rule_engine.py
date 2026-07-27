@@ -522,6 +522,11 @@ def evaluate_entry(signals: dict) -> dict:
         context_warnings.append(c_rsi["rsi_warning"])
 
     # ─────────────────────────────────────────────────────────────────────────
+    # TAHAP 5b: Hitung Confidence / Setup Quality Scoring
+    # ─────────────────────────────────────────────────────────────────────────
+    quality_res = calculate_setup_quality(signals, c_h1, c_m5, c_rsi)
+
+    # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 6: Susun output lengkap
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -529,6 +534,12 @@ def evaluate_entry(signals: dict) -> dict:
         # Keputusan akhir
         "keputusan"  : keputusan,
         "arah"       : arah_label,
+
+        # Confidence / Setup Quality Scoring (auditable breakdown)
+        "setup_quality"       : quality_res["setup_quality"],
+        "setup_quality_score" : quality_res["setup_quality_score"],
+        "setup_quality_max"   : quality_res["setup_quality_max"],
+        "quality_breakdown"   : quality_res["quality_breakdown"],
 
         # Alasan — untuk UI dan audit
         "alasan_entry" : alasan_entry,
@@ -553,6 +564,129 @@ def evaluate_entry(signals: dict) -> dict:
         # Bisa berisi: warning sesi low-liquidity, warning gap weekend, warning RSI kontekstual
         "context_warnings" : context_warnings,
     }
+
+
+# =============================================================================
+# HELPER INTERNAL — Setup Quality Scoring (Auditable 0-8 Poin)
+# =============================================================================
+
+def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) -> dict:
+    """
+    Hitung setup_quality ("STRONG", "MODERATE", "WEAK") berbasis point-based scoring (0-8 Poin).
+
+    4 Komponen Scoring:
+        1. EMA Gap Strength (0-2 pts): Kekuatan trend M5 dari gap EMA
+        2. Alignment H1 & M5 (0-2 pts): Keselarasan bias makro H1 dan trigger M5
+        3. RSI Zone (0-2 pts): RSI netral optimum vs ekstrem
+        4. Swing Distance (0-2 pts): Jarak harga ke struktur swing terdekat vs ATR
+    """
+    breakdown = {}
+    total_score = 0
+
+    # 1. EMA Gap Strength (0-2)
+    ema_gap_pct = abs(signals.get("ema_gap_pct", 0.0))
+    if ema_gap_pct >= 0.15:
+        score_gap = 2
+        detail_gap = f"Gap EMA {ema_gap_pct:+.4f}% (Trend Kuat >= 0.15%)"
+    elif ema_gap_pct >= 0.08:
+        score_gap = 1
+        detail_gap = f"Gap EMA {ema_gap_pct:+.4f}% (Trend Sedang 0.08-0.15%)"
+    else:
+        score_gap = 0
+        detail_gap = f"Gap EMA {ema_gap_pct:+.4f}% (Trend Tipis < 0.08%)"
+    total_score += score_gap
+    breakdown["ema_gap"] = {
+        "score": score_gap, "max": 2, "label": "Kekuatan Trend M5 (EMA Gap)", "detail": detail_gap
+    }
+
+    # 2. Timeframe Alignment (0-2)
+    trend_h1 = signals.get("trend_h1", "SIDEWAYS")
+    trend_m5 = signals.get("trend", "SIDEWAYS")
+    if trend_h1 == trend_m5 and trend_h1 in ("UPTREND", "DOWNTREND"):
+        score_align = 2
+        detail_align = f"Searah — H1 {trend_h1} & M5 {trend_m5}"
+    elif (trend_h1 in ("UPTREND", "DOWNTREND") and trend_m5 == "SIDEWAYS") or \
+         (trend_m5 in ("UPTREND", "DOWNTREND") and trend_h1 == "SIDEWAYS"):
+        score_align = 1
+        detail_align = f"Parsial — H1 {trend_h1} vs M5 {trend_m5}"
+    else:
+        score_align = 0
+        detail_align = f"Konflik / Netral — H1 {trend_h1} vs M5 {trend_m5}"
+    total_score += score_align
+    breakdown["alignment"] = {
+        "score": score_align, "max": 2, "label": "Keselarasan Timeframe H1 & M5", "detail": detail_align
+    }
+
+    # 3. RSI Zone (0-2)
+    rsi = signals.get("rsi_14", 50.0)
+    if 40.0 <= rsi <= 60.0:
+        score_rsi = 2
+        detail_rsi = f"RSI {rsi:.1f} (Zona Optimum Netral 40-60)"
+    elif (30.0 <= rsi < 40.0) or (60.0 < rsi <= 70.0):
+        score_rsi = 1
+        detail_rsi = f"RSI {rsi:.1f} (Zona Waspada 30-40 / 60-70)"
+    else:
+        score_rsi = 0
+        detail_rsi = f"RSI {rsi:.1f} (Zona Ekstrem <30 / >70)"
+    total_score += score_rsi
+    breakdown["rsi_zone"] = {
+        "score": score_rsi, "max": 2, "label": "Zona RSI M5", "detail": detail_rsi
+    }
+
+    # 4. Swing Distance (0-2)
+    close_price = signals.get("close", 0.0)
+    atr = signals.get("atr_14", 1.5)
+    sw_low = signals.get("swing_low")
+    sw_high = signals.get("swing_high")
+
+    swing_dist = None
+    if trend_h1 == "UPTREND" or trend_m5 == "UPTREND":
+        if sw_low is not None:
+            swing_dist = abs(close_price - sw_low)
+    elif trend_h1 == "DOWNTREND" or trend_m5 == "DOWNTREND":
+        if sw_high is not None:
+            swing_dist = abs(sw_high - close_price)
+
+    if swing_dist is None:
+        if sw_low is not None:
+            swing_dist = abs(close_price - sw_low)
+        elif sw_high is not None:
+            swing_dist = abs(sw_high - close_price)
+
+    if swing_dist is not None and atr > 0:
+        atr_ratio = swing_dist / atr
+        if atr_ratio >= 1.5:
+            score_swing = 2
+            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR — Luas)"
+        elif atr_ratio >= 0.8:
+            score_swing = 1
+            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR — Cukup)"
+        else:
+            score_swing = 0
+            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR — Sempit)"
+    else:
+        score_swing = 0
+        detail_swing = "Swing Tidak Ditemukan / Sempit (Fallback ATR)"
+    total_score += score_swing
+    breakdown["swing_distance"] = {
+        "score": score_swing, "max": 2, "label": "Jarak ke Swing Structure", "detail": detail_swing
+    }
+
+    # Penentuan Label Quality
+    if total_score >= 6:
+        quality_label = "STRONG"
+    elif total_score >= 4:
+        quality_label = "MODERATE"
+    else:
+        quality_label = "WEAK"
+
+    return {
+        "setup_quality"       : quality_label,
+        "setup_quality_score" : total_score,
+        "setup_quality_max"   : 8,
+        "quality_breakdown"   : breakdown,
+    }
+
 
 
 # =============================================================================

@@ -29,6 +29,9 @@
         </div>
       </div>
       <div class="header-meta">
+        <a href="/history" class="meta-badge highlight" style="text-decoration: none; cursor: pointer;">
+          📚 Histori Analisis
+        </a>
         <div class="meta-badge highlight">
           <span class="meta-dot"></span>
           XAUUSD
@@ -146,12 +149,43 @@
           </div>
         </section>
 
+        <!-- Setup Quality Scoring Card -->
+        {% if result.setup_quality %}
+        <section class="quality-card quality-{{ result.setup_quality | lower }}">
+          <div class="quality-header">
+            <div class="quality-title-group">
+              <span class="quality-label">Kualitas Setup (Confidence Score)</span>
+              <div class="quality-badge badge-{{ result.setup_quality | lower }}">
+                {{ result.setup_quality }} ({{ result.setup_quality_score }} / {{ result.setup_quality_max }} Poin)
+              </div>
+            </div>
+          </div>
+          <div class="quality-breakdown-grid">
+            {% for key, item in result.quality_breakdown.items() %}
+            <div class="quality-item">
+              <div class="quality-item-head">
+                <span class="quality-item-label">{{ item.label }}</span>
+                <span class="quality-item-score">{{ item.score }}/{{ item.max }} Pts</span>
+              </div>
+              <p class="quality-item-detail">{{ item.detail }}</p>
+            </div>
+            {% endfor %}
+          </div>
+        </section>
+        {% endif %}
+
+
         <!-- Risk Management Card -->
         {% if result.risk and result.risk.valid %}
           {% if result.keputusan == 'BUY' %}
             {% set risk_badge_class = 'card-badge badge-buy' %}
-          {% else %}
+            {% set risk_badge_text = 'BUY ' ~ (result.arah or '') %}
+          {% elif result.keputusan == 'SELL' %}
             {% set risk_badge_class = 'card-badge badge-sell' %}
+            {% set risk_badge_text = 'SELL ' ~ (result.arah or '') %}
+          {% else %}
+            {% set risk_badge_class = 'card-badge badge-warning' %}
+            {% set risk_badge_text = 'ACUAN PROYEKSI LEVEL (WAIT)' %}
           {% endif %}
 
           <section class="card" id="card-risk">
@@ -163,8 +197,9 @@
                 </svg>
                 <h2 class="card-title">Setup Manajemen Risiko</h2>
               </div>
-              <span class="{{ risk_badge_class }}">{{ result.keputusan }} {{ result.arah }}</span>
+              <span class="{{ risk_badge_class }}">{{ risk_badge_text }}</span>
             </div>
+
             
             <div class="card-body">
               <!-- Trade Target Flow Layout -->
@@ -415,9 +450,33 @@
                 <span class="{{ gap_class }}">{{ gap_prefix }}{{ result.signals.ema_gap_pct }}%</span>
               </div>
 
+              {% if result.signals.atr_14 %}
+              <div class="signal-item">
+                <div class="signal-header-row">
+                  <span class="signal-label">ATR 14 (Volatilitas)</span>
+                  <span class="condition-tag">ATR</span>
+                </div>
+                <span class="signal-value mono">${{ result.signals.atr_14 }}</span>
+              </div>
+              {% endif %}
+
+              {% if result.signals.swing_low or result.signals.swing_high %}
+              <div class="signal-item">
+                <div class="signal-header-row">
+                  <span class="signal-label">Struktur Swing</span>
+                  <span class="condition-tag">Swing</span>
+                </div>
+                <span class="signal-value mono" style="font-size: 0.78rem;">
+                  {% if result.signals.swing_low %}Low: ${{ result.signals.swing_low }}{% endif %}
+                  {% if result.signals.swing_high %} High: ${{ result.signals.swing_high }}{% endif %}
+                </span>
+              </div>
+              {% endif %}
+
             </div>
           </div>
         </section>
+
 
         <!-- Condition Breakdown Card -->
         <section class="card" id="card-conditions">

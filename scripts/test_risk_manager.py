@@ -125,11 +125,19 @@ if df is None:
     shutdown_mt5()
     sys.exit(1)
 
-df = run_all_indicators(df)   # → tambah ema_9, ema_21, rsi_14, trend, atr_14
+df_h1 = get_candles(timeframe_str="H1", count=100)
+if df_h1 is None:
+    shutdown_mt5()
+    sys.exit(1)
+
+df    = run_all_indicators(df)      # → tambah ema_9, ema_21, rsi_14, trend, atr_14
+df_h1 = run_all_indicators(df_h1)   # → H1 indicators
 
 print("\n[ STEP 3 ] Evaluasi kondisi entry...")
 signals = get_latest_signals(df)
+signals["trend_h1"] = get_latest_signals(df_h1)["trend"]
 hasil   = evaluate_entry(signals)
+
 
 # ── Tampilkan ringkasan kondisi market ──────────────────────────────────────
 print()

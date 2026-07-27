@@ -41,16 +41,17 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
 import MetaTrader5 as mt5
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, jsonify
 
 from engine.data_fetcher  import initialize_mt5, get_candles, shutdown_mt5
 from engine.indicators    import run_all_indicators, get_latest_signals
 from engine.rule_engine   import evaluate_entry
 from engine.risk_manager  import calculate_sl_tp
+from engine.history_logger import init_db, log_analysis, get_history, update_outcome
 
 
 # =============================================================================
-# SETUP FLASK
+# SETUP FLASK & DATABASE
 # =============================================================================
 # __name__ adalah variabel Python yang berisi nama file ini.
 # Flask memakainya untuk menemukan folder templates/ dan static/ secara otomatis.
@@ -61,6 +62,10 @@ app = Flask(
     template_folder="templates",
     static_folder="static",
 )
+
+# Inisialisasi tabel SQLite history.db saat server dinyalakan
+init_db()
+
 
 
 # =============================================================================
@@ -170,39 +175,53 @@ def analyze():
         print("→ Mengevaluasi kondisi entry...")
         decision = evaluate_entry(signals)
 
-        # ── LANGKAH 6: Hitung SL/TP jika BUY atau SELL ───────────────────────
-        risk = None
-        if decision["keputusan"] in ("BUY", "SELL"):
-            print(f"→ Menghitung SL/TP untuk {decision['keputusan']}...")
+        # ── LANGKAH 6: Hitung SL/TP (BUY, SELL, atau Acuan Proyeksi jika WAIT) ───
+        print(f"→ Menghitung acuan SL/TP & Manajemen Risiko ({decision['keputusan']})...")
+        symbol    = os.getenv("MT5_SYMBOL", "XAUUSD")
+        tick_info = None
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is not None and tick.ask > 0 and tick.bid > 0:
+                tick_info = {"ask": tick.ask, "bid": tick.bid}
+                print(f"   Tick real-time: ask={tick.ask:.2f} bid={tick.bid:.2f} "
+                      f"spread={tick.ask - tick.bid:.5f}")
+            else:
+                print("   ⚠️ Tick tidak tersedia — fallback ke close price")
+        except Exception as e:
+            print(f"   ⚠️ Gagal ambil tick ({e}) — fallback ke close price")
 
-            # Ambil harga bid/ask real-time dari MT5 untuk entry yang akurat.
-            # BUY  → entry pakai harga ask (harga eksekusi nyata)
-            # SELL → entry pakai harga bid
-            # Jika gagal ambil tick (jaringan/simbol error) → fallback ke close price.
-            symbol    = os.getenv("MT5_SYMBOL", "XAUUSD")
-            tick_info = None
-            try:
-                tick = mt5.symbol_info_tick(symbol)
-                if tick is not None and tick.ask > 0 and tick.bid > 0:
-                    tick_info = {"ask": tick.ask, "bid": tick.bid}
-                    print(f"   Tick real-time: ask={tick.ask:.2f} bid={tick.bid:.2f} "
-                          f"spread={tick.ask - tick.bid:.5f}")
-                else:
-                    print("   ⚠️ Tick tidak tersedia — fallback ke close price")
-            except Exception as e:
-                print(f"   ⚠️ Gagal ambil tick ({e}) — fallback ke close price")
+        # Tentukan arah kalkulasi risiko: jika BUY/SELL gunakan keputusan, jika WAIT gunakan bias/trend
+        risk_direction = decision["keputusan"]
+        if risk_direction not in ("BUY", "SELL"):
+            h1_bias = signals.get("trend_h1", "SIDEWAYS")
+            m5_trend = signals.get("trend", "SIDEWAYS")
+            if h1_bias == "DOWNTREND" or m5_trend == "DOWNTREND":
+                risk_direction = "SELL"
+            else:
+                risk_direction = "BUY"
 
-            risk = calculate_sl_tp(
-                df        = df_m5,
-                entry     = signals["close"],
-                arah      = decision["keputusan"],
-                tick_info = tick_info,
-            )
+        risk = calculate_sl_tp(
+            df        = df_m5,
+            entry     = signals["close"],
+            arah      = risk_direction,
+            tick_info = tick_info,
+        )
+        if risk and isinstance(risk, dict):
+            risk["is_estimate"] = (decision["keputusan"] == "WAIT")
+
 
         # ── LANGKAH 7: Susun semua data untuk dikirim ke template HTML ────────
         # Template HTML tidak bisa langsung akses dict nested yang kompleks,
         # jadi kita susun ulang menjadi struktur yang lebih flat dan mudah dipakai.
         result = _build_result(signals, decision, risk)
+
+        # ── LANGKAH 7b: Catat histori ke SQLite database ─────────────────────
+        try:
+            rowid = log_analysis(decision, signals, risk)
+            result["history_id"] = rowid
+            print(f"💾 Histori analisis tersimpan ke database (ID: {rowid})")
+        except Exception as log_err:
+            print(f"⚠️ Gagal menyimpan histori ke SQLite: {log_err}")
 
         print(f"✅ Analisis selesai: {decision['keputusan']}")
         return render_template("index.html", result=result, error=None)
@@ -226,6 +245,39 @@ def analyze():
 
 
 # =============================================================================
+# ROUTE 3: Endpoint Histori Analisis & API Outcome
+# =============================================================================
+
+@app.route("/history", methods=["GET"])
+def history_page():
+    """
+    Tampilkan halaman histori analisis trading dari SQLite.
+    """
+    records = get_history(limit=100)
+    return render_template("history.html", history=records)
+
+
+@app.route("/api/history/outcome", methods=["POST"])
+def update_history_outcome():
+    """
+    API endpoint untuk memperbarui status outcome trade (WIN / LOSS / EXPIRED / MANUAL_CLOSE).
+    """
+    data = request.get_json(silent=True) or request.form
+    record_id = data.get("record_id")
+    outcome = data.get("outcome")
+    notes = data.get("notes", "")
+
+    if not record_id or not outcome:
+        return jsonify({"success": False, "error": "record_id dan outcome wajib diisi"}), 400
+
+    try:
+        success = update_outcome(int(record_id), str(outcome), str(notes))
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# =============================================================================
 # HELPER: Susun Dict Hasil Analisis untuk Template
 # =============================================================================
 
@@ -233,23 +285,21 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
     """
     Susun semua data ke dalam satu dict yang siap dipakai di template HTML.
 
-    Kenapa fungsi terpisah?
-        Agar fungsi analyze() tetap bersih dan fokus pada alur utama.
-        Logika "susun data untuk UI" dipindahkan ke sini.
-
     Struktur output:
-        result["keputusan"]     : "BUY" / "SELL" / "WAIT"
-        result["signals"]       : dict nilai indikator terbaru
-        result["kondisi"]       : list kondisi dengan status terpenuhi/tidak
-        result["alasan_entry"]  : list string alasan entry
-        result["alasan_wait"]   : list string alasan wait
-        result["risk"]          : dict SL/TP/RRR (None jika WAIT)
-        result["waktu"]         : string waktu evaluasi
+        result["keputusan"]           : "BUY" / "SELL" / "WAIT"
+        result["setup_quality"]       : "STRONG" / "MODERATE" / "WEAK"
+        result["setup_quality_score"] : int (0-8)
+        result["quality_breakdown"]   : dict breakdown 4 komponen
+        result["signals"]             : dict nilai indikator terbaru
+        result["kondisi"]             : list kondisi dengan status terpenuhi/tidak
+        result["alasan_entry"]        : list string alasan entry
+        result["alasan_wait"]         : list string alasan wait
+        result["risk"]                : dict SL/TP/RRR (None jika WAIT)
+        result["waktu"]               : string waktu evaluasi
     """
     keputusan = decision["keputusan"]
 
     # ── Susun breakdown kondisi sebagai list yang mudah di-loop di HTML ───────
-    # Setiap item adalah dict: {nama, terpenuhi, keterangan, arah}
     kondisi_list = []
 
     # Kondisi 1: Bias H1 (sumber independen — timeframe lebih besar)
@@ -283,32 +333,32 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
     })
 
     # ── Format waktu evaluasi ─────────────────────────────────────────────────
-    # Waktu dari MT5 berformat "2026-07-24 08:20:00+00:00" (UTC)
-    # Kita sederhanakan menjadi string yang lebih rapi
     waktu_raw = str(decision["waktu_evaluasi"])
     try:
-        # Coba potong bagian "+00:00" dan tampilkan "YYYY-MM-DD HH:MM UTC"
         waktu = waktu_raw.replace("+00:00", " UTC").replace("T", " ")[:20] + " UTC"
     except Exception:
-        waktu = waktu_raw  # fallback jika format tidak sesuai ekspektasi
+        waktu = waktu_raw
 
     return {
-        "keputusan"       : keputusan,
-        "arah"            : decision.get("arah"),            # "LONG" / "SHORT" / None
-        "signals"         : signals,
-        "kondisi"         : kondisi_list,
-        "alasan_entry"    : decision.get("alasan_entry", []),
-        "alasan_wait"     : decision.get("alasan_wait",  []),
-        "konfirmasi"      : {
+        "keputusan"           : keputusan,
+        "arah"                : decision.get("arah"),            # "LONG" / "SHORT" / None
+        "setup_quality"       : decision.get("setup_quality", "WEAK"),
+        "setup_quality_score" : decision.get("setup_quality_score", 0),
+        "setup_quality_max"   : decision.get("setup_quality_max", 8),
+        "quality_breakdown"   : decision.get("quality_breakdown", {}),
+        "signals"             : signals,
+        "kondisi"             : kondisi_list,
+        "alasan_entry"        : decision.get("alasan_entry", []),
+        "alasan_wait"         : decision.get("alasan_wait",  []),
+        "konfirmasi"          : {
             "terpenuhi"  : decision["konfirmasi_terpenuhi"],
             "dibutuhkan" : decision["konfirmasi_dibutuhkan"],
         },
-        "risk"            : risk,    # None jika WAIT
-        "waktu"           : waktu,
-        # Peringatan konteks — tidak mempengaruhi keputusan, hanya informatif
-        # Bisa berisi: sesi low-liquidity, mendekati close Jumat, RSI ekstrem di trend kuat
-        "context_warnings": decision.get("context_warnings", []),
+        "risk"                : risk,    # None jika WAIT
+        "waktu"               : waktu,
+        "context_warnings"    : decision.get("context_warnings", []),
     }
+
 
 
 # =============================================================================
