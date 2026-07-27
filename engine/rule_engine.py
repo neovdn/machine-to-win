@@ -25,8 +25,24 @@ FILOSOFI DESAIN ("Checklist Kondisi"):
 LOGIKA MURNI IF-ELSE — TIDAK ADA AI / MACHINE LEARNING.
 
 KONDISI YANG DIEVALUASI SAAT INI:
-    [1] _check_trend_and_ema  : Trend direction + EMA 9/21 alignment (digabung)
-    [2] _check_rsi_filter     : RSI sebagai filter/veto (bukan kondisi entry)
+    [1] _check_bias_h1        : Arah bias dari timeframe H1
+    [2] _check_ema_trigger_m5 : EMA cross timing dari M5
+    [F] _check_rsi_filter     : RSI sebagai filter/veto kontekstual (bukan kondisi entry)
+
+RSI FILTER KONTEKSTUAL (versi terbaru):
+    Perilaku RSI filter berbeda tergantung kekuatan trend (ema_gap_pct):
+    - Trend KUAT  (|ema_gap_pct| >= RSI_STRONG_TREND_EMA_GAP_THRESHOLD):
+        RSI overbought/oversold TIDAK memblokir entry — treat sebagai potensi
+        continuation. Warning tetap dicatat di field "rsi_warning" untuk audit.
+    - Trend LEMAH (|ema_gap_pct| < threshold):
+        Veto ketat seperti sebelumnya — RSI ekstrem MEMBATALKAN entry.
+
+CONTEXT WARNINGS (session_filter):
+    evaluate_entry() juga menjalankan session_filter untuk mendeteksi:
+    - Apakah sesi sedang low liquidity (di luar London/NY overlap)
+    - Apakah mendekati market close Jumat (risiko gap weekend)
+    Hasil berupa list string di field "context_warnings" — TIDAK mengubah
+    keputusan BUY/SELL/WAIT, hanya ditampilkan di UI sebagai informasi konteks.
 
 CARA TAMBAH KONDISI BARU NANTI:
     1. Buat fungsi baru: def _check_NAMAKONDISI(signals): ...
@@ -36,6 +52,9 @@ CARA TAMBAH KONDISI BARU NANTI:
 """
 
 from datetime import datetime, timezone
+
+# session_filter diimport secara lazy di dalam evaluate_entry() untuk menghindari
+# circular import dan agar module ini tetap bisa ditest tanpa session_filter.
 
 
 # =============================================================================
@@ -48,107 +67,175 @@ from datetime import datetime, timezone
 RSI_OVERBOUGHT = 70.0   # RSI > nilai ini = kondisi overbought → blokir BUY
 RSI_OVERSOLD   = 30.0   # RSI < nilai ini = kondisi oversold   → blokir SELL
 
+# Threshold kekuatan trend untuk RSI filter KONTEKSTUAL
+#
+# Jika |ema_gap_pct| >= nilai ini → trend dianggap KUAT:
+#   RSI overbought/oversold TIDAK memblokir entry (potensi continuation).
+#   Warning tetap dicatat di breakdown untuk audit.
+#
+# Jika |ema_gap_pct| < nilai ini → trend LEMAH:
+#   Veto ketat seperti biasa — RSI ekstrem membatalkan entry.
+#
+# Contoh untuk XAUUSD ~$3300:
+#   ema_gap_pct = 0.15%  →  jarak EMA ≈ $4.95  (trend yang sudah cukup jelas)
+#   ema_gap_pct = 0.05%  →  jarak EMA ≈ $1.65  (masih terlalu tipis)
+# Nilai 0.15% bisa dikalibrasi ulang setelah observasi data nyata.
+RSI_STRONG_TREND_EMA_GAP_THRESHOLD = 0.15  # dalam persen (abs value)
+
 # Jumlah kondisi ENTRY yang harus terpenuhi untuk menghasilkan BUY/SELL
 # (kondisi entry = semua kondisi _check_... KECUALI filter seperti RSI)
-MINIMUM_CONDITIONS_MET = 1   # saat ini hanya 1 kondisi entry (_check_trend_and_ema)
+#
+# Dinaikkan ke 2 setelah split kondisi menjadi dua sumber independen:
+#   [1] _check_bias_h1()        — arah dari H1 (timeframe lebih besar)
+#   [2] _check_ema_trigger_m5() — timing dari EMA cross M5
+# Keduanya harus searah sebelum engine boleh output BUY atau SELL.
+MINIMUM_CONDITIONS_MET = 2
 
 
 # =============================================================================
-# KONDISI 1: TREND + EMA ALIGNMENT
+# KONDISI 1: BIAS ARAH DARI H1
 # =============================================================================
-# STATUS: DIGABUNG (sumber yang sama — detect_trend() sudah pakai EMA cross)
+# Sumber: detect_trend() dijalankan pada candle H1 (timeframe lebih besar).
+# Fungsi ini membaca signals["trend_h1"] yang sudah diisi oleh caller
+# (app.py atau script) sebelum memanggil evaluate_entry().
 #
-# CATATAN UNTUK PENGEMBANGAN NANTI:
-#   Fungsi ini mengevaluasi DUA aspek sekaligus:
-#     A) Trend label dari detect_trend()  → apakah UPTREND / DOWNTREND?
-#     B) EMA cross dari nilai ema_9/ema_21 → apakah EMA cepat > EMA lambat?
+# Peran: menentukan ARAH BIAS market secara makro. Timeframe H1 bergerak
+# lebih lambat sehingga tren di sini lebih bermakna dan lebih susah dipalsukan
+# oleh noise intraday M5.
 #
-#   Saat ini keduanya selalu sejalan karena detect_trend() menggunakan
-#   EMA cross sebagai salah satu syaratnya.
-#
-#   SPLIT POINT: Saat kamu nanti punya detect_trend() yang pakai timeframe
-#   lebih besar (misal H1), pisahkan fungsi ini menjadi:
-#     - _check_trend(signals)       → evaluasi trend label dari H1
-#     - _check_ema_alignment(signals) → evaluasi EMA cross dari M5
-#   Dan ubah MINIMUM_CONDITIONS_MET = 2
+# Catatan: kondisi ini INDEPENDEN dari kondisi EMA M5 di bawah — sumbernya
+# berbeda timeframe, bukan turunan satu sama lain.
 
-def _check_trend_and_ema(signals: dict) -> dict:
+def _check_bias_h1(signals: dict) -> dict:
     """
-    Evaluasi apakah arah trend dan EMA alignment mendukung entry.
+    Evaluasi arah bias dari trend H1.
+
+    Membaca signals["trend_h1"] yang merupakan label trend dari candle H1,
+    dihitung menggunakan detect_trend() yang sama dengan M5 tapi pada
+    DataFrame H1 yang berbeda.
 
     LOGIKA:
-        BUY  ← trend == "UPTREND"   (artinya: ema_9 > ema_21 DAN close > ema_21)
-        SELL ← trend == "DOWNTREND" (artinya: ema_9 < ema_21 DAN close < ema_21)
-        WAIT ← trend == "SIDEWAYS"  (tidak ada konfirmasi arah jelas)
+        BUY   ← trend_h1 == "UPTREND"    (bias makro bullish)
+        SELL  ← trend_h1 == "DOWNTREND"  (bias makro bearish)
+        NETRAL ← trend_h1 == "SIDEWAYS"  (pasar konsolidasi di H1 — tunggu)
 
     Return dict:
         {
-            "terpenuhi"  : bool   — True jika ada arah jelas (UP atau DOWN)
-            "arah"       : str    — "BUY", "SELL", atau "NETRAL"
-            "keterangan" : str    — penjelasan ringkas
-            "trend"      : str    — nilai mentah dari signals["trend"]
-            # Detail internal (berguna saat split nanti):
-            "_trend_label"  : str  — nilai dari signals["trend"]
-            "_ema_cross"    : str  — "EMA9>EMA21", "EMA9<EMA21", atau "SAMA"
+            "terpenuhi"  : bool  — True jika ada arah jelas (UP atau DOWN)
+            "arah"       : str   — "BUY", "SELL", atau "NETRAL"
+            "keterangan" : str   — penjelasan ringkas
+            "trend_h1"   : str   — nilai mentah dari signals["trend_h1"]
         }
     """
-    trend   = signals["trend"]
+    trend_h1 = signals["trend_h1"]
+
+    if trend_h1 == "UPTREND":
+        terpenuhi  = True
+        arah_final = "BUY"
+        keterangan = f"Bias H1: UPTREND (EMA9 > EMA21, Close > EMA21) — bias makro bullish"
+    elif trend_h1 == "DOWNTREND":
+        terpenuhi  = True
+        arah_final = "SELL"
+        keterangan = f"Bias H1: DOWNTREND (EMA9 < EMA21, Close < EMA21) — bias makro bearish"
+    else:  # SIDEWAYS
+        terpenuhi  = False
+        arah_final = "NETRAL"
+        keterangan = f"Bias H1: SIDEWAYS — pasar konsolidasi di timeframe H1, TUNGGU"
+
+    return {
+        "terpenuhi"  : terpenuhi,
+        "arah"       : arah_final,
+        "keterangan" : keterangan,
+        "trend_h1"   : trend_h1,
+    }
+
+
+# =============================================================================
+# KONDISI 2: EMA TRIGGER DARI M5
+# =============================================================================
+# Sumber: signals["trend"] (label trend M5) + signals["ema_9"] / signals["ema_21"]
+# dari candle M5 terbaru.
+#
+# Peran: menentukan TIMING ENTRY — apakah EMA M5 sudah cross ke arah yang
+# benar dan harga sudah di posisi yang tepat? Ini "pemicu" yang memvalidasi
+# bahwa momentum M5 selaras dengan bias H1.
+#
+# PENTING — tidak sirkular:
+#   signals["trend"] = label trend M5 dari detect_trend(df_m5)
+#   EMA cross dievaluasi ULANG dari nilai ema_9 / ema_21 yang sama.
+#   Memang derive dari sumber yang sama, TAPI kondisi ini hanya lolos
+#   ke output BUY/SELL jika JUGA searah dengan bias_h1 (kondisi 1).
+#   Dua kondisi dari sumber berbeda (H1 dan M5) harus konsisten — itulah
+#   yang mencegah false confidence.
+
+def _check_ema_trigger_m5(signals: dict) -> dict:
+    """
+    Evaluasi apakah EMA M5 memberikan sinyal timing entry yang valid.
+
+    Memeriksa trend label M5 (dari detect_trend() pada candle M5) sekaligus
+    mengkonfirmasi posisi EMA9 vs EMA21 secara eksplisit untuk audit.
+
+    LOGIKA:
+        BUY  ← trend == "UPTREND"   (EMA9 > EMA21, Close > EMA21, gap cukup lebar)
+        SELL ← trend == "DOWNTREND" (EMA9 < EMA21, Close < EMA21, gap cukup lebar)
+        NETRAL ← trend == "SIDEWAYS" (EMA terlalu dekat atau harga di antara EMA)
+
+    Return dict:
+        {
+            "terpenuhi"  : bool  — True jika ada arah jelas (UP atau DOWN)
+            "arah"       : str   — "BUY", "SELL", atau "NETRAL"
+            "keterangan" : str   — penjelasan ringkas termasuk nilai EMA
+            "trend_m5"   : str   — nilai mentah dari signals["trend"]
+            "_ema_cross"  : str  — "EMA9>EMA21", "EMA9<EMA21", atau "SAMA"
+            "ema_gap_pct" : float — gap persen EMA9 vs EMA21 saat ini
+        }
+    """
+    trend   = signals["trend"]        # label trend M5 dari detect_trend(df_m5)
     ema_9   = signals["ema_9"]
     ema_21  = signals["ema_21"]
+    gap_pct = signals["ema_gap_pct"]  # sudah dihitung di detect_trend()
 
-    # ── Aspek A: Evaluasi trend label ──────────────────────────────────────
-    # (ini yang akan jadi fungsi _check_trend() sendiri saat split)
-    if trend == "UPTREND":
-        arah_dari_trend = "BUY"
-    elif trend == "DOWNTREND":
-        arah_dari_trend = "SELL"
-    else:
-        arah_dari_trend = "NETRAL"
-
-    # ── Aspek B: Evaluasi EMA cross ────────────────────────────────────────
-    # (ini yang akan jadi fungsi _check_ema_alignment() sendiri saat split)
+    # Konfirmasi arah EMA cross secara eksplisit (untuk audit)
     if ema_9 > ema_21:
         ema_cross = "EMA9>EMA21"
-        arah_dari_ema = "BUY"
     elif ema_9 < ema_21:
         ema_cross = "EMA9<EMA21"
-        arah_dari_ema = "SELL"
     else:
         ema_cross = "SAMA"
-        arah_dari_ema = "NETRAL"
 
-    # ── Gabungkan keduanya ─────────────────────────────────────────────────
-    # Saat ini: kedua aspek harus SAMA ARAH untuk kondisi terpenuhi
-    # (nanti saat dipisah, masing-masing punya logika independen)
-    if arah_dari_trend == arah_dari_ema and arah_dari_trend != "NETRAL":
-        terpenuhi = True
-        arah_final = arah_dari_trend
+    # Tentukan arah dan apakah kondisi terpenuhi berdasarkan trend label M5
+    # (detect_trend() sudah menerapkan threshold gap — kalau SIDEWAYS di sini
+    #  artinya gap terlalu tipis atau harga di antara EMA)
+    if trend == "UPTREND":
+        terpenuhi  = True
+        arah_final = "BUY"
         keterangan = (
-            f"Trend {trend} + {ema_cross} "
-            f"(EMA9={ema_9:.2f} vs EMA21={ema_21:.2f}) — searah {arah_final}"
+            f"Trigger M5: UPTREND — {ema_cross} "
+            f"(EMA9={ema_9:.2f} vs EMA21={ema_21:.2f}, gap={gap_pct:+.4f}%)"
         )
-    elif arah_dari_trend == "NETRAL":
-        terpenuhi = False
-        arah_final = "NETRAL"
-        keterangan = f"Trend SIDEWAYS — tidak ada arah jelas, TUNGGU"
-    else:
-        # Kondisi konflik: trend dan EMA menunjuk arah berbeda
-        # (Ini tidak akan terjadi saat ini, tapi bisa terjadi setelah split)
-        terpenuhi = False
+    elif trend == "DOWNTREND":
+        terpenuhi  = True
+        arah_final = "SELL"
+        keterangan = (
+            f"Trigger M5: DOWNTREND — {ema_cross} "
+            f"(EMA9={ema_9:.2f} vs EMA21={ema_21:.2f}, gap={gap_pct:+.4f}%)"
+        )
+    else:  # SIDEWAYS
+        terpenuhi  = False
         arah_final = "NETRAL"
         keterangan = (
-            f"Konflik: trend menunjuk {arah_dari_trend} tapi EMA menunjuk {arah_dari_ema} "
-            f"— tidak cukup keyakinan untuk entry"
+            f"Trigger M5: SIDEWAYS — {ema_cross} "
+            f"(EMA9={ema_9:.2f} vs EMA21={ema_21:.2f}, gap={gap_pct:+.4f}%) "
+            f"— EMA terlalu dekat atau harga di antara EMA, TUNGGU"
         )
 
     return {
-        "terpenuhi"    : terpenuhi,
-        "arah"         : arah_final,
-        "keterangan"   : keterangan,
-        "trend"        : trend,
-        # Field internal — berguna untuk debugging dan saat split nanti
-        "_trend_label" : trend,
-        "_ema_cross"   : ema_cross,
+        "terpenuhi"  : terpenuhi,
+        "arah"       : arah_final,
+        "keterangan" : keterangan,
+        "trend_m5"   : trend,
+        "_ema_cross"  : ema_cross,
+        "ema_gap_pct" : gap_pct,
     }
 
 
@@ -161,30 +248,45 @@ def _check_trend_and_ema(signals: dict) -> dict:
 
 def _check_rsi_filter(signals: dict, arah_kandidat: str) -> dict:
     """
-    Evaluasi apakah RSI memblokir entry ke arah tertentu.
+    Evaluasi apakah RSI memblokir entry ke arah tertentu — dengan mode kontekstual.
 
     RSI dipakai sebagai FILTER, bukan kondisi entry utama.
     Artinya: RSI yang bagus tidak MENDORONG entry, tapi RSI ekstrem bisa
     MEMBATALKAN entry yang sudah dikonfirmasi kondisi lain.
 
-    Logika veto:
+    LOGIKA KONTEKSTUAL (berdasarkan kekuatan trend):
+
+    Trend KUAT (|ema_gap_pct| >= RSI_STRONG_TREND_EMA_GAP_THRESHOLD):
+        RSI overbought/oversold TIDAK otomatis veto — dalam trend kuat, RSI
+        bisa tetap ekstrem untuk waktu yang cukup lama (momentum continuation).
+        Entry tetap diizinkan, tapi warning dicatat di field "rsi_warning"
+        agar trader tetap sadar kondisi RSI saat ini.
+        mode_kontekstual = "TREND_KUAT"
+
+    Trend LEMAH (|ema_gap_pct| < threshold):
+        Veto ketat seperti sebelumnya.
         - arah BUY  + RSI > 70 → BLOKIR (overbought, risiko reversal tinggi)
         - arah SELL + RSI < 30 → BLOKIR (oversold, risiko reversal tinggi)
-        - Semua kondisi lain   → TIDAK memblokir (entry tetap bisa jalan)
+        mode_kontekstual = "TREND_LEMAH"
 
     Parameter:
-        signals        : dict dari get_latest_signals()
-        arah_kandidat  : "BUY" atau "SELL" (arah yang mau dicheck)
+        signals        : dict dari get_latest_signals() — harus ada "rsi_14", "ema_gap_pct"
+        arah_kandidat  : "BUY", "SELL", atau "NETRAL"
 
     Return dict:
         {
-            "memblokir"  : bool  — True berarti entry DIBATALKAN oleh RSI
-            "rsi"        : float — nilai RSI terbaru
-            "zona"       : str   — "OVERBOUGHT", "OVERSOLD", atau "NETRAL"
-            "keterangan" : str   — penjelasan
+            "memblokir"        : bool     — True berarti entry DIBATALKAN oleh RSI
+            "rsi"              : float    — nilai RSI terbaru
+            "zona"             : str      — "OVERBOUGHT", "OVERSOLD", atau "NETRAL"
+            "keterangan"       : str      — penjelasan utama
+            "rsi_warning"      : str|None — pesan peringatan jika RSI ekstrem tapi
+                                            tidak memblokir (mode TREND_KUAT)
+            "mode_kontekstual" : str      — "TREND_KUAT" atau "TREND_LEMAH"
+            "ema_gap_pct"      : float    — nilai gap yang dipakai untuk mode check
         }
     """
-    rsi = signals["rsi_14"]
+    rsi         = signals["rsi_14"]
+    ema_gap_pct = signals["ema_gap_pct"]
 
     # Tentukan zona RSI
     if rsi > RSI_OVERBOUGHT:
@@ -194,31 +296,75 @@ def _check_rsi_filter(signals: dict, arah_kandidat: str) -> dict:
     else:
         zona = "NETRAL"
 
-    # Tentukan apakah RSI memblokir arah yang dimaksud
+    # Tentukan mode kontekstual berdasarkan kekuatan trend
+    # (abs() karena ema_gap_pct negatif untuk downtrend)
+    is_strong_trend = abs(ema_gap_pct) >= RSI_STRONG_TREND_EMA_GAP_THRESHOLD
+    mode_kontekstual = "TREND_KUAT" if is_strong_trend else "TREND_LEMAH"
+
+    # ── Evaluasi veto berdasarkan mode kontekstual ────────────────────────────
+
+    rsi_warning = None  # default: tidak ada warning tambahan
+
     if arah_kandidat == "BUY" and zona == "OVERBOUGHT":
-        memblokir = True
-        keterangan = (
-            f"RSI {rsi:.1f} > {RSI_OVERBOUGHT} (OVERBOUGHT) — "
-            f"harga sudah terlalu tinggi, blokir BUY"
-        )
+        if is_strong_trend:
+            # Trend kuat — RSI ekstrem kemungkinan besar momentum continuation
+            # TIDAK blokir, tapi catat sebagai warning
+            memblokir = False
+            keterangan = (
+                f"RSI {rsi:.1f} (OVERBOUGHT) — trend KUAT (gap EMA {ema_gap_pct:+.4f}%), "
+                f"RSI tidak memblokir (potensi continuation)"
+            )
+            rsi_warning = (
+                f"⚠️ RSI {rsi:.1f} > {RSI_OVERBOUGHT} (OVERBOUGHT) — "
+                f"dalam trend kuat ini dianggap continuation, bukan reversal signal. "
+                f"Pantau price action dengan hati-hati."
+            )
+        else:
+            # Trend lemah — veto normal
+            memblokir = True
+            keterangan = (
+                f"RSI {rsi:.1f} > {RSI_OVERBOUGHT} (OVERBOUGHT) — "
+                f"trend lemah (gap EMA {ema_gap_pct:+.4f}%), blokir BUY"
+            )
+
     elif arah_kandidat == "SELL" and zona == "OVERSOLD":
-        memblokir = True
-        keterangan = (
-            f"RSI {rsi:.1f} < {RSI_OVERSOLD} (OVERSOLD) — "
-            f"harga sudah terlalu rendah, blokir SELL"
-        )
+        if is_strong_trend:
+            # Trend kuat — oversold dalam downtrend bisa continuation
+            memblokir = False
+            keterangan = (
+                f"RSI {rsi:.1f} (OVERSOLD) — trend KUAT (gap EMA {ema_gap_pct:+.4f}%), "
+                f"RSI tidak memblokir (potensi continuation)"
+            )
+            rsi_warning = (
+                f"⚠️ RSI {rsi:.1f} < {RSI_OVERSOLD} (OVERSOLD) — "
+                f"dalam trend kuat ini dianggap continuation, bukan reversal signal. "
+                f"Pantau price action dengan hati-hati."
+            )
+        else:
+            # Trend lemah — veto normal
+            memblokir = True
+            keterangan = (
+                f"RSI {rsi:.1f} < {RSI_OVERSOLD} (OVERSOLD) — "
+                f"trend lemah (gap EMA {ema_gap_pct:+.4f}%), blokir SELL"
+            )
+
     else:
+        # RSI netral, atau arah NETRAL — tidak ada konflik
         memblokir = False
         keterangan = (
-            f"RSI {rsi:.1f} — zona {zona}, "
+            f"RSI {rsi:.1f} — zona {zona} "
+            f"[{mode_kontekstual}, gap EMA {ema_gap_pct:+.4f}%], "
             f"tidak memblokir entry {arah_kandidat}"
         )
 
     return {
-        "memblokir"  : memblokir,
-        "rsi"        : rsi,
-        "zona"       : zona,
-        "keterangan" : keterangan,
+        "memblokir"        : memblokir,
+        "rsi"              : rsi,
+        "zona"             : zona,
+        "keterangan"       : keterangan,
+        "rsi_warning"      : rsi_warning,
+        "mode_kontekstual" : mode_kontekstual,
+        "ema_gap_pct"      : ema_gap_pct,
     }
 
 
@@ -233,13 +379,15 @@ def evaluate_entry(signals: dict) -> dict:
     ALUR KERJA:
         1. Jalankan semua kondisi entry → kumpulkan hasilnya
         2. Hitung berapa kondisi yang terpenuhi, dan ke arah apa
-        3. Cek filter RSI terhadap arah kandidat
+        3. Cek filter RSI kontekstual terhadap arah kandidat
         4. Tentukan keputusan final: BUY / SELL / WAIT
-        5. Kumpulkan semua info ke dalam satu dict output
+        5. Kumpulkan context warnings dari session_filter (tidak mempengaruhi keputusan)
+        6. Kumpulkan semua info ke dalam satu dict output
 
     Parameter:
         signals : dict dari get_latest_signals() — minimal harus punya:
-                  "trend", "ema_9", "ema_21", "rsi_14", "close", "time"
+                  "trend", "trend_h1", "ema_9", "ema_21", "ema_gap_pct",
+                  "rsi_14", "close", "time"
 
     Return:
         dict berisi:
@@ -252,6 +400,8 @@ def evaluate_entry(signals: dict) -> dict:
             "konfirmasi_dibutuhkan"  : int       — minimum yang dibutuhkan
             "close"                  : float     — harga close terbaru
             "waktu_evaluasi"         : str       — timestamp evaluasi
+            "context_warnings"       : list[str] — peringatan konteks dari session filter
+                                                   (TIDAK mengubah keputusan BUY/SELL/WAIT)
     """
     _validate_signals(signals)
 
@@ -264,12 +414,18 @@ def evaluate_entry(signals: dict) -> dict:
     # Untuk tambah kondisi baru: tambah pemanggilan fungsi di sini
     # dan masukkan hasilnya ke dalam `kondisi_entry`
 
-    c_trend = _check_trend_and_ema(signals)
+    c_h1  = _check_bias_h1(signals)
+    c_m5  = _check_ema_trigger_m5(signals)
 
     # Kumpulkan semua hasil kondisi entry ke dalam list
     # Format: (nama_kondisi, hasil_dict)
+    #
+    # [1] bias_h1       — sumber independen: trend dari timeframe H1
+    # [2] ema_trigger_m5 — sumber independen: EMA cross pada timeframe M5
+    # Keduanya harus searah (kedua-duanya BUY atau kedua-duanya SELL).
     kondisi_entry = [
-        ("trend_and_ema", c_trend),
+        ("bias_h1",        c_h1),
+        ("ema_trigger_m5", c_m5),
         # ("sr_level",    _check_sr_level(signals)),    # ← tambah di sini nanti
         # ("candle_pattern", _check_candle(signals)),   # ← atau ini
     ]
@@ -340,7 +496,33 @@ def evaluate_entry(signals: dict) -> dict:
         alasan_wait.append(c_rsi["keterangan"])
 
     # ─────────────────────────────────────────────────────────────────────────
-    # TAHAP 5: Susun output lengkap
+    # TAHAP 5: Kumpulkan context warnings dari session_filter
+    # ─────────────────────────────────────────────────────────────────────────
+    # Lazy import — agar evaluate_entry() tetap bisa ditest tanpa session_filter.
+    # Jika import gagal (lingkungan minimal), context_warnings cukup kosong.
+    context_warnings = []
+    try:
+        from engine import session_filter as _sf
+
+        sess = _sf.is_high_liquidity_session(signals["time"])
+        if sess["warning"] is not None:
+            context_warnings.append(sess["warning"])
+
+        close_check = _sf.is_near_market_close(signals["time"])
+        if close_check["warning"] is not None:
+            context_warnings.append(close_check["warning"])
+
+    except Exception:
+        # Gagal import atau gagal proses → tidak crash, context_warnings tetap kosong
+        pass
+
+    # Tambahkan rsi_warning ke context_warnings jika ada (dari RSI filter kontekstual)
+    # Ini memastikan warning RSI muncul di UI meski RSI tidak memblokir entry
+    if c_rsi.get("rsi_warning") is not None:
+        context_warnings.append(c_rsi["rsi_warning"])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TAHAP 6: Susun output lengkap
     # ─────────────────────────────────────────────────────────────────────────
 
     return {
@@ -354,8 +536,9 @@ def evaluate_entry(signals: dict) -> dict:
 
         # Breakdown detail tiap kondisi — untuk audit mendalam
         "kondisi_detail" : {
-            "trend_and_ema" : c_trend,
-            "rsi_filter"    : c_rsi,
+            "bias_h1"        : c_h1,
+            "ema_trigger_m5" : c_m5,
+            "rsi_filter"     : c_rsi,
         },
 
         # Statistik konfirmasi
@@ -365,6 +548,10 @@ def evaluate_entry(signals: dict) -> dict:
         # Context market saat evaluasi
         "close"           : signals["close"],
         "waktu_evaluasi"  : str(signals["time"]),
+
+        # Peringatan konteks — TIDAK mengubah keputusan, hanya informasi untuk trader
+        # Bisa berisi: warning sesi low-liquidity, warning gap weekend, warning RSI kontekstual
+        "context_warnings" : context_warnings,
     }
 
 
@@ -386,13 +573,14 @@ def _validate_signals(signals: dict) -> None:
             f"Pastikan kamu memanggil get_latest_signals() terlebih dahulu."
         )
 
-    required = ["trend", "ema_9", "ema_21", "rsi_14", "close", "time"]
+    required = ["trend", "trend_h1", "ema_9", "ema_21", "rsi_14", "close", "time", "ema_gap_pct"]
     missing  = [k for k in required if k not in signals]
 
     if missing:
         raise ValueError(
             f"Field berikut tidak ada di signals: {missing}\n"
             f"Field tersedia: {list(signals.keys())}\n"
-            f"Pastikan signals berasal dari get_latest_signals() yang sudah "
-            f"melewati run_all_indicators()."
+            f"Pastikan:\n"
+            f"  1. signals berasal dari get_latest_signals(df_m5) yang sudah melewati run_all_indicators()\n"
+            f"  2. signals['trend_h1'] sudah diisi dari hasil get_latest_signals(df_h1)['trend']"
         )

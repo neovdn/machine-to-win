@@ -21,6 +21,16 @@ KENAPA LOGIKA min/max PENTING:
 FALLBACK:
     Kalau swing tidak ditemukan dalam lookback window → pakai ATR saja (tidak error).
 
+SPREAD-AWARE ENTRY (versi terbaru):
+    Jika caller memberikan tick_info (dict berisi 'ask' dan 'bid'), harga entry
+    yang dipakai bukan lagi close candle tapi harga eksekusi nyata:
+        BUY  → entry = tick_info['ask']  (kita membeli di harga ask)
+        SELL → entry = tick_info['bid']  (kita menjual di harga bid)
+    Spread = ask - bid, dicatat di output.
+    rrr_after_spread = RRR yang sudah memperhitungkan cost spread di kedua sisi.
+    Jika tick_info = None, fallback ke parameter 'entry' (biasanya close) —
+    output backward-compatible.
+
 LOGIKA MURNI — TIDAK ADA AI / MACHINE LEARNING.
 """
 
@@ -162,56 +172,98 @@ def calculate_sl_tp(
     atr_multiplier : float = ATR_MULTIPLIER,
     swing_lookback : int   = SWING_LOOKBACK,
     swing_buffer   : float = SWING_BUFFER,
+    tick_info      : dict | None = None,
 ) -> dict:
     """
     Hitung SL dan TP menggunakan pendekatan Hybrid ATR + Swing.
 
     ALUR KALKULASI:
-        1. Ambil nilai ATR terbaru dari DataFrame (sudah dihitung di indicators.py)
-        2. Hitung SL versi ATR:
+        1. Tentukan harga entry yang sebenarnya:
+             Jika tick_info ada → pakai ask (BUY) atau bid (SELL) dari tick real-time
+             Jika tick_info = None → pakai parameter 'entry' (biasanya close, backward-compat)
+        2. Ambil nilai ATR terbaru dari DataFrame (sudah dihitung di indicators.py)
+        3. Hitung SL versi ATR:
              BUY : sl_atr = entry − (atr_multiplier × atr)
              SELL: sl_atr = entry + (atr_multiplier × atr)
-        3. Cari swing terdekat (swing low untuk BUY, swing high untuk SELL)
-        4. Hitung SL versi Swing (jika swing ditemukan):
+        4. Cari swing terdekat (swing low untuk BUY, swing high untuk SELL)
+        5. Hitung SL versi Swing (jika swing ditemukan):
              BUY : sl_swing = swing_level − swing_buffer
              SELL: sl_swing = swing_level + swing_buffer
-        5. Pilih SL final yang LEBIH JAUH dari entry (lebih konservatif):
+        6. Pilih SL final yang LEBIH JAUH dari entry (lebih konservatif):
              BUY : sl_final = min(sl_atr, sl_swing)  ← lebih RENDAH = lebih jauh
              SELL: sl_final = max(sl_atr, sl_swing)  ← lebih TINGGI = lebih jauh
-        6. Hitung TP: TP = entry ± (jarak_SL × rrr_min)
+        7. Hitung TP: TP = entry ± (jarak_SL × rrr_min)
+        8. Hitung spread & rrr_after_spread jika tick_info tersedia
 
     Parameter:
         df             : DataFrame yang sudah melewati run_all_indicators()
                          — harus punya kolom 'atr_14', 'high', 'low'
-        entry          : Harga entry (biasanya close candle terbaru)
+        entry          : Harga entry fallback (dipakai jika tick_info = None).
+                         Biasanya close candle terbaru.
         arah           : "BUY" atau "SELL"
         rrr_min        : RRR minimum. TP = entry ± (jarak_SL × rrr_min)
         atr_multiplier : Pengali ATR untuk SL minimum
         swing_lookback : Berapa candle ditelusuri untuk cari swing
         swing_buffer   : Buffer dollar di luar swing level
+        tick_info      : Dict dengan key 'ask' dan 'bid' dari mt5.symbol_info_tick().
+                         Jika diberikan:
+                           - BUY  → entry pakai ask (harga eksekusi nyata)
+                           - SELL → entry pakai bid
+                           - spread, rrr_after_spread dihitung dan dimasukkan ke output
+                         Jika None: fallback ke parameter 'entry' (backward-compatible).
 
     Return:
         dict berisi:
-            "valid"         : bool   — False jika data tidak mencukupi
-            "entry"         : float  — harga entry
-            "sl"            : float  — harga Stop Loss final
-            "tp"            : float  — harga Take Profit
-            "rrr"           : float  — RRR aktual yang dihasilkan
-            "jarak_sl"      : float  — jarak absolut entry ke SL (dalam dollar)
-            "jarak_tp"      : float  — jarak absolut entry ke TP (dalam dollar)
-            "sl_method"     : str    — "SWING" atau "ATR" (dari mana SL berasal)
-            "atr_value"     : float  — nilai ATR aktual
-            "sl_atr_level"  : float  — SL versi ATR (selalu dihitung, untuk referensi)
-            "sl_swing_raw"  : float|None — harga swing yang ditemukan (sebelum buffer)
-            "sl_swing_level": float|None — SL versi swing (setelah buffer)
-            "pesan"         : str    — penjelasan singkat bagaimana SL dihitung
+            "valid"            : bool   — False jika data tidak mencukupi
+            "entry"            : float  — harga entry yang dipakai (ask/bid/close)
+            "entry_type"       : str    — "ASK", "BID", atau "CLOSE" (untuk audit)
+            "sl"               : float  — harga Stop Loss final
+            "tp"               : float  — harga Take Profit
+            "rrr"              : float  — RRR aktual
+            "jarak_sl"         : float  — jarak absolut entry ke SL (dalam dollar)
+            "jarak_tp"         : float  — jarak absolut entry ke TP (dalam dollar)
+            "sl_method"        : str    — "SWING" atau "ATR"
+            "atr_value"        : float  — nilai ATR aktual
+            "sl_atr_level"     : float  — SL versi ATR (selalu dihitung, untuk referensi)
+            "sl_swing_raw"     : float|None — harga swing yang ditemukan (sebelum buffer)
+            "sl_swing_level"   : float|None — SL versi swing (setelah buffer)
+            "spread"           : float|None — lebar spread (ask-bid) saat evaluasi.
+                                              None jika tick_info tidak diberikan.
+            "rrr_after_spread" : float|None — RRR setelah memperhitungkan spread sebagai
+                                              biaya di kedua sisi (entry + exit).
+                                              None jika spread tidak tersedia.
+            "pesan"            : str    — penjelasan singkat bagaimana SL dihitung
     """
     _validate_inputs(df, entry, arah, rrr_min)
 
     atr_col = f"atr_{ATR_PERIOD}"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 1: Ambil nilai ATR terbaru
+    # LANGKAH 1: Tentukan harga entry yang sebenarnya
+    # ─────────────────────────────────────────────────────────────────────────
+    # Jika tick_info diberikan: pakai harga ask (BUY) atau bid (SELL) dari tick real-time.
+    # Ini mencerminkan harga eksekusi nyata, bukan harga close historis.
+    # Jika tidak ada (None): fallback ke parameter 'entry' (backward-compatible).
+
+    spread     = None  # default: spread tidak diketahui
+    entry_type = "CLOSE"  # default
+
+    if tick_info is not None:
+        ask = tick_info.get("ask")
+        bid = tick_info.get("bid")
+
+        if ask is not None and bid is not None and ask > 0 and bid > 0:
+            spread = round(ask - bid, 5)
+
+            if arah == "BUY":
+                entry = float(ask)   # BUY dieksekusi di harga ask
+                entry_type = "ASK"
+            else:  # SELL
+                entry = float(bid)   # SELL dieksekusi di harga bid
+                entry_type = "BID"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LANGKAH 2: Ambil nilai ATR terbaru
     # ─────────────────────────────────────────────────────────────────────────
     # Gunakan iloc[-1] = nilai dari candle paling baru
     atr_value = float(df[atr_col].iloc[-1])
@@ -285,6 +337,23 @@ def calculate_sl_tp(
     rrr      = jarak_tp / jarak_sl if jarak_sl > 0 else 0.0
 
     # ─────────────────────────────────────────────────────────────────────────
+    # LANGKAH 6: Hitung RRR setelah memperhitungkan spread (cost transaksi)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Spread adalah biaya yang ditanggung dua kali:
+    #   - Saat entry: kita membeli di ask (lebih mahal dari bid)
+    #   - Saat exit : kita menutup posisi dan terkena spread lagi
+    # RRR "bersih" memperhitungkan biaya ini:
+    #   BUY  : profit bersih = jarak_tp - spread
+    #          risiko kotor  = jarak_sl + spread  (SL kena hit dari harga yang sudah lebih atas)
+    #   SELL : simetris
+    # Jika spread tidak diketahui (tick_info=None), field ini None.
+    rrr_after_spread = None
+    if spread is not None and jarak_sl > 0:
+        effective_profit = max(0.0, jarak_tp - spread)
+        effective_risk   = jarak_sl + spread
+        rrr_after_spread = round(effective_profit / effective_risk, 2) if effective_risk > 0 else 0.0
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Susun pesan audit
     # ─────────────────────────────────────────────────────────────────────────
     if sl_method == "SWING" and swing_raw is not None:
@@ -303,19 +372,22 @@ def calculate_sl_tp(
         )
 
     return {
-        "valid"          : True,
-        "entry"          : round(entry,    2),
-        "sl"             : round(sl_final, 2),
-        "tp"             : round(tp,       2),
-        "rrr"            : round(rrr,      2),
-        "jarak_sl"       : round(jarak_sl, 2),
-        "jarak_tp"       : round(jarak_tp, 2),
-        "sl_method"      : sl_method,
-        "atr_value"      : round(atr_value, 2),
-        "sl_atr_level"   : round(sl_atr,    2),
-        "sl_swing_raw"   : round(swing_raw, 2) if swing_raw is not None else None,
-        "sl_swing_level" : round(sl_swing,  2) if sl_swing  is not None else None,
-        "pesan"          : pesan,
+        "valid"            : True,
+        "entry"            : round(entry,    2),
+        "entry_type"       : entry_type,
+        "sl"               : round(sl_final, 2),
+        "tp"               : round(tp,       2),
+        "rrr"              : round(rrr,      2),
+        "jarak_sl"         : round(jarak_sl, 2),
+        "jarak_tp"         : round(jarak_tp, 2),
+        "sl_method"        : sl_method,
+        "atr_value"        : round(atr_value, 2),
+        "sl_atr_level"     : round(sl_atr,    2),
+        "sl_swing_raw"     : round(swing_raw, 2) if swing_raw is not None else None,
+        "sl_swing_level"   : round(sl_swing,  2) if sl_swing  is not None else None,
+        "spread"           : round(spread, 5) if spread is not None else None,
+        "rrr_after_spread" : rrr_after_spread,
+        "pesan"            : pesan,
     }
 
 

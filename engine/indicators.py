@@ -152,7 +152,7 @@ def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 # BAGIAN 3: DETEKSI TREND
 # =============================================================================
 
-def detect_trend(df: pd.DataFrame) -> pd.DataFrame:
+def detect_trend(df: pd.DataFrame, min_ema_gap_pct: float = 0.05) -> pd.DataFrame:
     """
     Mendeteksi kondisi trend berdasarkan posisi EMA 9, EMA 21, dan harga close.
 
@@ -161,26 +161,50 @@ def detect_trend(df: pd.DataFrame) -> pd.DataFrame:
         UPTREND (trend naik):
             - EMA 9 > EMA 21 (garis cepat di atas garis lambat = momentum naik)
             - Close > EMA 21 (harga di atas garis lambat = buyer in control)
+            - abs(ema_gap_pct) >= min_ema_gap_pct (jarak EMA cukup lebar)
 
         DOWNTREND (trend turun):
             - EMA 9 < EMA 21 (garis cepat di bawah = momentum turun)
             - Close < EMA 21 (harga di bawah = seller in control)
+            - abs(ema_gap_pct) >= min_ema_gap_pct (jarak EMA cukup lebar)
 
         SIDEWAYS / KONSOLIDASI:
-            - Semua kondisi lain (EMA terlalu dekat, atau harga di antara EMA)
-            - Ini kondisi "tunggu" — tidak ada sinyal jelas
+            - Semua kondisi lain — termasuk:
+              a) EMA terlalu dekat (|gap| < min_ema_gap_pct): zona choppy/konsolidasi
+              b) Harga di antara EMA: arah tidak jelas
+            - Ini kondisi "tunggu" — tidak ada sinyal yang bisa dipercaya
+
+    THRESHOLD KEKUATAN TREND (min_ema_gap_pct):
+        Kalau EMA 9 dan EMA 21 hampir menyentuh satu sama lain, label
+        "UPTREND" atau "DOWNTREND" menyesatkan — secara visual chart terlihat
+        choppy, bukan trending. Threshold ini memaksa label ke SIDEWAYS jika
+        jarak EMA terlalu tipis untuk dianggap sebagai tren yang valid.
+
+        Contoh untuk XAUUSD di ~$3300:
+            min_ema_gap_pct = 0.05%  →  jarak minimum ≈ $1.65
+            gap = -0.0132%  →  |gap| = 0.0132% < 0.05%  →  paksa SIDEWAYS
+            gap = -0.18%    →  |gap| = 0.18%   ≥ 0.05%  →  DOWNTREND valid
+
+        Nilai 0.05% adalah titik awal kalibrasi — bisa disesuaikan setelah
+        observasi data nyata. Semakin tinggi threshold, semakin ketat filter.
 
     TAMBAHAN: Kekuatan trend
         Selain label trend, kita juga hitung 'ema_gap_pct' — jarak antara
         EMA 9 dan EMA 21 dalam persen. Makin lebar jarak, makin kuat trendnya.
 
     Parameter:
-        df : DataFrame yang sudah melewati calculate_ema() — butuh 'ema_9', 'ema_21'
+        df              : DataFrame yang sudah melewati calculate_ema() — butuh
+                          kolom 'close', 'ema_9', 'ema_21'
+        min_ema_gap_pct : Threshold minimum |ema_gap_pct| agar tren dianggap
+                          valid (bukan SIDEWAYS). Default: 0.05%.
+                          Buat lebih besar untuk filter yang lebih ketat.
 
     Return:
         DataFrame yang sama + kolom baru:
             'trend'       : string "UPTREND", "DOWNTREND", atau "SIDEWAYS"
             'ema_gap_pct' : jarak EMA 9 vs EMA 21 dalam persen (float)
+                            Positif = EMA9 di atas EMA21 (bullish)
+                            Negatif = EMA9 di bawah EMA21 (bearish)
     """
     _check_dataframe(df, required_columns=["close", "ema_9", "ema_21"])
 
@@ -193,23 +217,32 @@ def detect_trend(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_gap_pct"] = (df["ema_9"] - df["ema_21"]) / df["ema_21"] * 100
 
     # ─────────────────────────────────────────────────────────────────────────
+    # Cek apakah jarak EMA cukup lebar untuk dianggap tren valid
+    # Ini adalah prasyarat tambahan di atas syarat EMA cross + price position
+    # ─────────────────────────────────────────────────────────────────────────
+    gap_cukup = df["ema_gap_pct"].abs() >= min_ema_gap_pct
+
+    # ─────────────────────────────────────────────────────────────────────────
     # Tentukan label trend menggunakan np.select (lebih efisien dari apply/loop)
     # np.select: mirip if-elif-else tapi untuk seluruh kolom sekaligus
     # ─────────────────────────────────────────────────────────────────────────
 
     # Definisikan kondisi (urutan penting! kondisi pertama yang match = dipakai)
     conditions = [
-        # Kondisi UPTREND: EMA cepat di atas EMA lambat DAN harga di atas EMA lambat
-        (df["ema_9"] > df["ema_21"]) & (df["close"] > df["ema_21"]),
+        # Kondisi UPTREND: EMA cepat di atas EMA lambat, harga di atas EMA lambat,
+        # DAN jarak EMA cukup lebar (tidak sekadar menyentuh satu sama lain)
+        (df["ema_9"] > df["ema_21"]) & (df["close"] > df["ema_21"]) & gap_cukup,
 
-        # Kondisi DOWNTREND: EMA cepat di bawah EMA lambat DAN harga di bawah EMA lambat
-        (df["ema_9"] < df["ema_21"]) & (df["close"] < df["ema_21"]),
+        # Kondisi DOWNTREND: EMA cepat di bawah EMA lambat, harga di bawah EMA lambat,
+        # DAN jarak EMA cukup lebar
+        (df["ema_9"] < df["ema_21"]) & (df["close"] < df["ema_21"]) & gap_cukup,
     ]
 
     # Nilai yang dikembalikan untuk setiap kondisi (urutan sama dengan conditions)
     choices = ["UPTREND", "DOWNTREND"]
 
-    # default = nilai jika tidak ada kondisi yang match
+    # default = SIDEWAYS jika tidak ada kondisi yang match —
+    # termasuk saat EMA sudah cross tapi gapnya terlalu tipis (choppy zone)
     df["trend"] = np.select(conditions, choices, default="SIDEWAYS")
 
     return df

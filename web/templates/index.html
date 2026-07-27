@@ -181,15 +181,18 @@
                       <div class="risk-block-note">-${{ result.risk.jarak_sl }} dari entry</div>
                     </div>
 
-                    <!-- Entry Price (Center) -->
-                    <div class="risk-block risk-block-entry">
-                      <div class="risk-block-label-wrapper">
-                        <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 14 14"></polyline></svg>
-                        <span>Entry Price</span>
-                      </div>
-                      <div class="risk-block-price">${{ result.risk.entry }}</div>
-                      <div class="risk-block-note">Monitored Close</div>
-                    </div>
+                       <div class="risk-block risk-block-entry">
+                       <div class="risk-block-label-wrapper">
+                         <svg class="risk-block-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 14 14"></polyline></svg>
+                         <span>Entry Price</span>
+                       </div>
+                       <div class="risk-block-price">${{ result.risk.entry }}</div>
+                       <div class="risk-block-note">
+                         {% if result.risk.entry_type == 'ASK' %}Harga ASK (Live)
+                         {% elif result.risk.entry_type == 'BID' %}Harga BID (Live)
+                         {% else %}Harga Close Candle{% endif %}
+                       </div>
+                     </div>
 
                     <!-- Take Profit (Right) -->
                     <div class="risk-block risk-block-tp">
@@ -217,7 +220,11 @@
                         <span>Entry Price</span>
                       </div>
                       <div class="risk-block-price">${{ result.risk.entry }}</div>
-                      <div class="risk-block-note">Monitored Close</div>
+                      <div class="risk-block-note">
+                        {% if result.risk.entry_type == 'ASK' %}Harga ASK (Live)
+                        {% elif result.risk.entry_type == 'BID' %}Harga BID (Live)
+                        {% else %}Harga Close Candle{% endif %}
+                      </div>
                     </div>
 
                     <div class="risk-block risk-block-sl">
@@ -269,6 +276,26 @@
                     <span>Swing Price Level</span>
                   </div>
                   <span class="risk-stat-value mono">${{ result.risk.sl_swing_raw }}</span>
+                </div>
+                {% endif %}
+
+                {% if result.risk.spread is not none %}
+                <div class="risk-stat-card">
+                  <div class="risk-stat-label-row">
+                    <svg class="risk-stat-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+                    <span>Spread (Ask−Bid)</span>
+                  </div>
+                  <span class="risk-stat-value mono">${{ result.risk.spread }}</span>
+                </div>
+                {% endif %}
+
+                {% if result.risk.rrr_after_spread is not none %}
+                <div class="risk-stat-card">
+                  <div class="risk-stat-label-row">
+                    <svg class="risk-stat-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="1" x2="12" y2="23"></line><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path></svg>
+                    <span>RRR (net spread)</span>
+                  </div>
+                  <span class="risk-stat-value rrr-highlight">{{ result.risk.rrr_after_spread }}:1</span>
                 </div>
                 {% endif %}
               </div>
@@ -460,6 +487,41 @@
 
           </div>
         </section>
+
+        <!-- Context Warnings Panel (session filter, RSI kontekstual) -->
+        {% if result.context_warnings %}
+        <section class="card card-warnings" id="card-context-warnings">
+          <div class="card-header">
+            <div class="card-title-group">
+              <svg class="card-header-icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                <line x1="12" y1="9" x2="12" y2="13"></line>
+                <line x1="12" y1="17" x2="12.01" y2="17"></line>
+              </svg>
+              <h2 class="card-title">Peringatan Konteks</h2>
+            </div>
+            <span class="card-badge badge-warning">Hanya Informasi</span>
+          </div>
+          <div class="card-body">
+            <p class="warnings-note">
+              Peringatan berikut <strong>tidak mempengaruhi</strong> keputusan BUY/SELL/WAIT.
+              Ini adalah konteks situasional yang sebaiknya diketahui sebelum eksekusi.
+            </p>
+            <div class="warnings-list">
+              {% for warning in result.context_warnings %}
+              <div class="warning-item">
+                <svg class="warning-item-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+                  <line x1="12" y1="9" x2="12" y2="13"></line>
+                  <line x1="12" y1="17" x2="12.01" y2="17"></line>
+                </svg>
+                <span>{{ warning }}</span>
+              </div>
+              {% endfor %}
+            </div>
+          </div>
+        </section>
+        {% endif %}
 
         {% else %}
 

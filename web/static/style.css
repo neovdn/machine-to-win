@@ -874,6 +874,77 @@ body {
   margin-top: 2rem;
 }
 
+/* ── Context Warnings Panel ─────────────────────────────────────────────── */
+/* Tampil hanya saat ada context_warnings dari session_filter atau RSI kontekstual */
+
+.card-warnings {
+  border-left: 3px solid var(--wait-color);
+  background-color: var(--wait-bg);
+}
+
+.card-warnings .card-header {
+  background-color: #fef3c7;  /* Amber 100 */
+  border-bottom-color: var(--wait-border);
+}
+
+.card-warnings .card-title {
+  color: #92400e;  /* Amber 800 */
+}
+
+.card-warnings .card-header-icon-svg {
+  color: var(--wait-color);
+}
+
+/* Badge khusus warning — warna amber */
+.badge-warning {
+  background-color: #fde68a;  /* Amber 200 */
+  color: #92400e;              /* Amber 800 */
+  font-weight: 600;
+  font-size: 0.72rem;
+  padding: 0.25rem 0.625rem;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.warnings-note {
+  font-size: 0.82rem;
+  color: #92400e;
+  margin-bottom: 0.875rem;
+  padding: 0.625rem 0.875rem;
+  background-color: #fef3c7;
+  border: 1px solid var(--wait-border);
+  border-radius: var(--radius-sm);
+  line-height: 1.5;
+}
+
+.warnings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.warning-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+  padding: 0.625rem 0.875rem;
+  background-color: rgba(253, 230, 138, 0.35);  /* Amber 200 @ 35% */
+  border: 1px solid var(--wait-border);
+  border-radius: var(--radius-sm);
+  font-size: 0.82rem;
+  color: #78350f;  /* Amber 900 */
+  line-height: 1.5;
+}
+
+.warning-item-icon {
+  flex-shrink: 0;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  color: var(--wait-color);
+}
+
 /* ── Responsive Adjustments ─────────────────────────────────────────────── */
 @media (max-width: 992px) {
   .dashboard-grid {

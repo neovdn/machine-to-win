@@ -16,13 +16,16 @@ CARA KERJA FLASK (penjelasan untuk pemula):
     "POST" = browser kirim data (kamu klik tombol submit)
 
 ALUR ANALISIS (di fungsi analyze()):
-    initialize_mt5()        ← sambungkan ke MT5 yang sedang berjalan
-    get_candles()           ← tarik 500 candle XAUUSD M5
-    run_all_indicators()    ← hitung EMA 9/21, RSI, ATR, trend
-    get_latest_signals()    ← ambil nilai terbaru sebagai dict
-    evaluate_entry()        ← rule engine: BUY / SELL / WAIT + breakdown
-    calculate_sl_tp()       ← hitung SL, TP, RRR (hanya jika BUY/SELL)
-    shutdown_mt5()          ← putuskan koneksi dengan bersih
+    initialize_mt5()                    ← sambungkan ke MT5 yang sedang berjalan
+    get_candles(timeframe="M5")         ← tarik 500 candle XAUUSD M5
+    get_candles(timeframe="H1", n=100)  ← tarik 100 candle XAUUSD H1 (bias makro)
+    run_all_indicators(df_m5)           ← hitung EMA 9/21, RSI, ATR, trend M5
+    run_all_indicators(df_h1)           ← hitung EMA 9/21, trend H1
+    get_latest_signals(df_m5)           ← ambil nilai terbaru sebagai dict
+    signals["trend_h1"] = ...           ← inject bias H1 ke signals M5
+    evaluate_entry(signals)             ← rule engine: BUY / SELL / WAIT + breakdown
+    calculate_sl_tp()                   ← hitung SL, TP, RRR (hanya jika BUY/SELL)
+    shutdown_mt5()                      ← putuskan koneksi dengan bersih
 """
 
 import sys
@@ -37,6 +40,7 @@ import os
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT_DIR)
 
+import MetaTrader5 as mt5
 from flask import Flask, render_template, request
 
 from engine.data_fetcher  import initialize_mt5, get_candles, shutdown_mt5
@@ -114,10 +118,10 @@ def analyze():
             )
         mt5_connected = True
 
-        # ── LANGKAH 2: Tarik data candle ─────────────────────────────────────
-        print("→ Menarik data candle...")
-        df = get_candles()
-        if df is None or df.empty:
+        # ── LANGKAH 2: Tarik data candle M5 ─────────────────────────────────
+        print("→ Menarik data candle M5...")
+        df_m5 = get_candles(timeframe_str="M5")  # default symbol dan count dari .env
+        if df_m5 is None or df_m5.empty:
             return render_template(
                 "index.html",
                 result=None,
@@ -127,13 +131,40 @@ def analyze():
                 ),
             )
 
-        # ── LANGKAH 3: Hitung semua indikator ────────────────────────────────
-        print("→ Menghitung indikator...")
-        df = run_all_indicators(df)
+        # ── LANGKAH 2b: Tarik data candle H1 (untuk bias makro) ─────────────
+        # 100 candle H1 ≈ 4 hari data — cukup untuk EMA 9/21 warm-up
+        print("→ Menarik data candle H1 (bias makro)...")
+        df_h1 = get_candles(timeframe_str="H1", count=100)
+        if df_h1 is None or df_h1.empty:
+            return render_template(
+                "index.html",
+                result=None,
+                error=(
+                    "❌ Gagal menarik data candle XAUUSD H1. "
+                    "Pastikan simbol XAUUSD tersedia di Market Watch MT5."
+                ),
+            )
 
-        # ── LANGKAH 4: Ambil nilai terbaru ───────────────────────────────────
+        # ── LANGKAH 3: Hitung semua indikator (M5) ───────────────────────────
+        print("→ Menghitung indikator M5...")
+        df_m5 = run_all_indicators(df_m5)
+
+        # ── LANGKAH 3b: Hitung indikator H1 (untuk bias) ─────────────────────
+        print("→ Menghitung indikator H1...")
+        df_h1 = run_all_indicators(df_h1)
+
+        # ── LANGKAH 4: Ambil nilai terbaru (dari M5) ─────────────────────────
         print("→ Mengambil sinyal terbaru...")
-        signals = get_latest_signals(df)
+        signals = get_latest_signals(df_m5)
+
+        # ── LANGKAH 4b: Inject bias H1 ke signals ────────────────────────────
+        # signals["trend_h1"] adalah sumber independen dari timeframe berbeda.
+        # Ini memastikan rule engine punya dua input yang benar-benar terpisah:
+        #   - signals["trend"]    = trend M5 (trigger timing)
+        #   - signals["trend_h1"] = trend H1 (bias arah makro)
+        h1_latest       = get_latest_signals(df_h1)
+        signals["trend_h1"] = h1_latest["trend"]
+        print(f"   H1 bias: {signals['trend_h1']} | M5 trigger: {signals['trend']}")
 
         # ── LANGKAH 5: Evaluasi kondisi entry (rule engine) ──────────────────
         print("→ Mengevaluasi kondisi entry...")
@@ -143,10 +174,29 @@ def analyze():
         risk = None
         if decision["keputusan"] in ("BUY", "SELL"):
             print(f"→ Menghitung SL/TP untuk {decision['keputusan']}...")
+
+            # Ambil harga bid/ask real-time dari MT5 untuk entry yang akurat.
+            # BUY  → entry pakai harga ask (harga eksekusi nyata)
+            # SELL → entry pakai harga bid
+            # Jika gagal ambil tick (jaringan/simbol error) → fallback ke close price.
+            symbol    = os.getenv("MT5_SYMBOL", "XAUUSD")
+            tick_info = None
+            try:
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is not None and tick.ask > 0 and tick.bid > 0:
+                    tick_info = {"ask": tick.ask, "bid": tick.bid}
+                    print(f"   Tick real-time: ask={tick.ask:.2f} bid={tick.bid:.2f} "
+                          f"spread={tick.ask - tick.bid:.5f}")
+                else:
+                    print("   ⚠️ Tick tidak tersedia — fallback ke close price")
+            except Exception as e:
+                print(f"   ⚠️ Gagal ambil tick ({e}) — fallback ke close price")
+
             risk = calculate_sl_tp(
-                df    = df,
-                entry = signals["close"],
-                arah  = decision["keputusan"],
+                df        = df_m5,
+                entry     = signals["close"],
+                arah      = decision["keputusan"],
+                tick_info = tick_info,
             )
 
         # ── LANGKAH 7: Susun semua data untuk dikirim ke template HTML ────────
@@ -202,13 +252,23 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
     # Setiap item adalah dict: {nama, terpenuhi, keterangan, arah}
     kondisi_list = []
 
-    # Kondisi 1: Trend + EMA Alignment
-    c_trend = decision["kondisi_detail"]["trend_and_ema"]
+    # Kondisi 1: Bias H1 (sumber independen — timeframe lebih besar)
+    c_h1 = decision["kondisi_detail"]["bias_h1"]
     kondisi_list.append({
-        "nama"       : "Trend + EMA Alignment",
-        "terpenuhi"  : c_trend["terpenuhi"],
-        "keterangan" : c_trend["keterangan"],
-        "arah"       : c_trend["arah"],
+        "nama"       : "Bias Arah H1",
+        "terpenuhi"  : c_h1["terpenuhi"],
+        "keterangan" : c_h1["keterangan"],
+        "arah"       : c_h1["arah"],
+        "tipe"       : "entry",  # kondisi entry (bukan filter)
+    })
+
+    # Kondisi 2: EMA Trigger M5 (timing entry dari timeframe trading)
+    c_m5 = decision["kondisi_detail"]["ema_trigger_m5"]
+    kondisi_list.append({
+        "nama"       : "EMA Trigger M5",
+        "terpenuhi"  : c_m5["terpenuhi"],
+        "keterangan" : c_m5["keterangan"],
+        "arah"       : c_m5["arah"],
         "tipe"       : "entry",  # kondisi entry (bukan filter)
     })
 
@@ -233,18 +293,21 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
         waktu = waktu_raw  # fallback jika format tidak sesuai ekspektasi
 
     return {
-        "keputusan"    : keputusan,
-        "arah"         : decision.get("arah"),            # "LONG" / "SHORT" / None
-        "signals"      : signals,
-        "kondisi"      : kondisi_list,
-        "alasan_entry" : decision.get("alasan_entry", []),
-        "alasan_wait"  : decision.get("alasan_wait",  []),
-        "konfirmasi"   : {
+        "keputusan"       : keputusan,
+        "arah"            : decision.get("arah"),            # "LONG" / "SHORT" / None
+        "signals"         : signals,
+        "kondisi"         : kondisi_list,
+        "alasan_entry"    : decision.get("alasan_entry", []),
+        "alasan_wait"     : decision.get("alasan_wait",  []),
+        "konfirmasi"      : {
             "terpenuhi"  : decision["konfirmasi_terpenuhi"],
             "dibutuhkan" : decision["konfirmasi_dibutuhkan"],
         },
-        "risk"  : risk,    # None jika WAIT
-        "waktu" : waktu,
+        "risk"            : risk,    # None jika WAIT
+        "waktu"           : waktu,
+        # Peringatan konteks — tidak mempengaruhi keputusan, hanya informatif
+        # Bisa berisi: sesi low-liquidity, mendekati close Jumat, RSI ekstrem di trend kuat
+        "context_warnings": decision.get("context_warnings", []),
     }
 
 

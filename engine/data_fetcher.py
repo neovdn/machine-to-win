@@ -257,3 +257,143 @@ def validate_data(df: pd.DataFrame) -> bool:
 
     print("✅ Validasi selesai")
     return True
+
+
+def get_candles_range(
+    date_from     : "datetime",
+    date_to       : "datetime",
+    symbol        : str = None,
+    timeframe_str : str = None,
+) -> "pd.DataFrame | None":
+    """
+    Mengambil data candle dalam rentang tanggal tertentu dari MT5.
+
+    Berbeda dengan get_candles() yang menggunakan start_pos (posisi relatif),
+    fungsi ini menggunakan copy_rates_range() yang menerima datetime absolut —
+    cocok untuk backtest di mana kita butuh rentang historis yang spesifik.
+
+    JAMINAN CANDLE CLOSED:
+        copy_rates_range() mengembalikan semua candle yang opening time-nya
+        berada dalam [date_from, date_to]. Candle aktif (sedang terbentuk)
+        tidak termasuk karena opening time-nya adalah "sekarang" yang masih
+        akan bergerak — broker umumnya tidak menyertakannya.
+
+        Namun untuk keamanan: caller yang memakai data ini untuk backtest
+        sebaiknya memastikan date_to cukup jauh di masa lalu (bukan "sekarang")
+        sehingga tidak ada ambiguitas.
+
+    Parameter:
+        date_from     : Tanggal mulai (datetime, harus tz-aware UTC)
+        date_to       : Tanggal akhir (datetime, harus tz-aware UTC)
+        symbol        : Nama instrumen. Default dari .env (MT5_SYMBOL)
+        timeframe_str : Timeframe string (misal "M5", "H1"). Default dari .env
+
+    Return:
+        pd.DataFrame dengan kolom: open, high, low, close, tick_volume
+        DatetimeIndex berisi waktu UTC.
+        None jika terjadi error.
+
+    Contoh:
+        from datetime import datetime, timezone
+        df = get_candles_range(
+            date_from = datetime(2026, 1, 1, tzinfo=timezone.utc),
+            date_to   = datetime(2026, 7, 25, tzinfo=timezone.utc),
+            timeframe_str = "M5",
+        )
+    """
+    symbol        = symbol        or os.getenv("MT5_SYMBOL", "XAUUSD")
+    timeframe_str = timeframe_str or os.getenv("MT5_TIMEFRAME", "M5")
+
+    if timeframe_str not in TIMEFRAME_MAP:
+        print(f"❌ Timeframe '{timeframe_str}' tidak dikenal.")
+        print(f"   Pilihan yang valid: {list(TIMEFRAME_MAP.keys())}")
+        return None
+
+    timeframe = TIMEFRAME_MAP[timeframe_str]
+
+    print(f"📊 Menarik candle {symbol} {timeframe_str} rentang tanggal:")
+    print(f"   Dari : {date_from}")
+    print(f"   S/d  : {date_to}")
+
+    # copy_rates_range: minta candle dengan opening time dalam [date_from, date_to]
+    rates = mt5.copy_rates_range(symbol, timeframe, date_from, date_to)
+
+    if rates is None or len(rates) == 0:
+        error_code, error_message = mt5.last_error()
+        print(f"❌ Gagal menarik data candle range!")
+        print(f"   Error code   : {error_code}")
+        print(f"   Error message: {error_message}")
+        print(f"   Pastikan rentang tanggal [{date_from} → {date_to}] ada dalam histori broker.")
+        return None
+
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    df = df[["time", "open", "high", "low", "close", "tick_volume"]]
+    df = df.set_index("time")
+
+    print(f"✅ Data berhasil ditarik: {len(df):,} candle")
+    print(f"   Rentang aktual: {df.index[0]} → {df.index[-1]}")
+    return df
+
+
+def save_candles_csv(
+    df          : "pd.DataFrame",
+    filepath    : str,
+) -> None:
+    """
+    Simpan DataFrame candle ke file CSV untuk cache lokal.
+
+    Berguna untuk reproducibility backtest: simpan sekali dari MT5,
+    lalu pakai ulang tanpa perlu MT5 terbuka di run berikutnya.
+
+    Format CSV yang disimpan:
+        - Index 'time' disertakan sebagai kolom pertama (index=True)
+        - Format datetime: ISO 8601 dengan timezone (preserves UTC info)
+
+    Parameter:
+        df       : DataFrame dengan DatetimeIndex (hasil dari get_candles atau get_candles_range)
+        filepath : Path file CSV tujuan (akan dibuat jika belum ada, ditimpa jika sudah ada)
+    """
+    import os as _os
+    _os.makedirs(_os.path.dirname(_os.path.abspath(filepath)), exist_ok=True)
+    df.to_csv(filepath, index=True)
+    print(f"💾 Data disimpan ke: {filepath} ({len(df):,} candle)")
+
+
+def load_candles_csv(filepath: str) -> "pd.DataFrame | None":
+    """
+    Load DataFrame candle dari file CSV cache lokal.
+
+    Kebalikan dari save_candles_csv(). Mengembalikan DataFrame dengan
+    DatetimeIndex UTC yang siap dipakai oleh run_all_indicators().
+
+    Parameter:
+        filepath : Path ke file CSV yang sudah disimpan oleh save_candles_csv()
+
+    Return:
+        pd.DataFrame dengan DatetimeIndex UTC, kolom OHLC + tick_volume.
+        None jika file tidak ditemukan atau format tidak valid.
+    """
+    import os as _os
+
+    if not _os.path.exists(filepath):
+        print(f"❌ File tidak ditemukan: {filepath}")
+        return None
+
+    try:
+        df = pd.read_csv(filepath, index_col="time", parse_dates=True)
+
+        # Pastikan index ber-timezone UTC
+        if df.index.tzinfo is None:
+            df.index = pd.DatetimeIndex(df.index).tz_localize("UTC")
+        else:
+            df.index = pd.DatetimeIndex(df.index).tz_convert("UTC")
+
+        df.index.name = "time"
+        print(f"📂 Data dimuat dari: {filepath}")
+        print(f"   {len(df):,} candle — {df.index[0]} → {df.index[-1]}")
+        return df
+
+    except Exception as e:
+        print(f"❌ Gagal load CSV: {e}")
+        return None
