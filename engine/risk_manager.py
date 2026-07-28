@@ -39,30 +39,35 @@ import numpy as np
 
 
 # =============================================================================
-# KONSTANTA KONFIGURASI DEFAULT
+# KONSTANTA KONFIGURASI DEFAULT (Profile: scalp_m5)
 # =============================================================================
 
-ATR_PERIOD        = 14    # Periode ATR (harus sama dengan yang di indicators.py)
-ATR_MULTIPLIER    = 1.5   # SL minimum = 1.5 × ATR dari entry
-RRR_MIN_DEFAULT   = 2.0   # TP = entry ± (jarak_SL × RRR minimum)
-SWING_LOOKBACK    = 50    # Berapa candle ke belakang untuk cari swing
-SWING_WING        = 5     # Berapa candle kiri & kanan untuk konfirmasi swing
-                          # (diubah dari 3 → 5 setelah analisis data nyata)
-                          #
-                          # TRADE-OFF WING SIZE DI XAUUSD M5:
-                          #   wing=3 : window 35 menit. Banyak swing ditemukan tapi
-                          #            sebagian adalah noise — lembah/puncak kecil yang
-                          #            tidak terlihat jelas di chart manual.
-                          #   wing=5 : window 55 menit (~1 jam). Menyaring swing kecil
-                          #            yang terlalu mirip satu sama lain, tapi masih
-                          #            menemukan swing yang benar-benar terlihat di chart.
-                          #            SL yang dihasilkan lebih bermakna secara visual.
-                          #   wing=8 : window 85 menit. Terlalu ketat — bisa melewatkan
-                          #            swing yang jelas terlihat (misal 30 menit lalu)
-                          #            dan lebih sering fallback ke ATR.
-                          #
-                          # KESIMPULAN: wing=5 adalah sweet spot untuk M5 XAUUSD.
-SWING_BUFFER      = 0.50  # Buffer dollar di luar swing (agar SL tidak persis di level)
+ATR_PERIOD          = 14    # Periode ATR (harus sama dengan yang di indicators.py)
+ATR_MULTIPLIER      = 0.9   # Pengali ATR default untuk scalp_m5
+RRR_MIN_DEFAULT     = 1.3   # TP = entry ± (jarak_SL × RRR minimum)
+SWING_LOOKBACK      = 15    # Berapa candle ke belakang untuk cari swing (~1 jam 15 min untuk M5)
+SWING_WING          = 3     # Window konfirmasi wing (±15 min)
+SWING_BUFFER        = 0.50  # Buffer dollar di luar swing (agar SL tidak persis di level)
+SWING_CLAMP_MIN_ATR = 0.7   # Batas minimum jarak SL terhadap ATR saat clamp
+SWING_CLAMP_MAX_ATR = 2.0   # Batas maksimum jarak SL terhadap ATR saat clamp
+
+
+# =============================================================================
+# PROFIL RISIKO (RISK PROFILES)
+# =============================================================================
+
+RISK_PROFILES = {
+    "scalp_m5": {
+        "atr_multiplier"     : 0.9,
+        "swing_lookback"     : 15,
+        "swing_wing"         : 3,
+        "rrr_min"            : 1.3,
+        "swing_clamp_min_atr": 0.7,
+        "swing_clamp_max_atr": 2.0,
+        "swing_buffer"       : 0.50,
+    },
+    # Profil lain dapat ditambahkan di sini jika dibutuhkan (misal "swing_m15")
+}
 
 
 # =============================================================================
@@ -84,28 +89,10 @@ def find_nearest_swing(
         Swing HIGH = candle yang nilai HIGH-nya lebih tinggi dari `wing` candle
                      di kiri DAN kanan. Ini titik "puncak" lokal pada chart.
 
-        Contoh swing low dengan wing=3:
-              High ─ ─ ─ ─ ─ ─ ─
-                         │ │
-            ─ ─ ─ ─ ─ ─ │ └── swing low: candle ini low-nya lebih rendah dari
-                         │     3 candle di kiri dan 3 candle di kanan
-              Low  ─ ─ ─ ┘
-
-    CARA KERJA:
-        1. Ambil `lookback` candle terakhir dari DataFrame (sudah dijamin closed semua
-           karena get_candles() menggunakan start_pos=1).
-        2. Namun candle PALING AKHIR di window tetap dikecualikan karena alasan teknikal
-           swing: candle paling akhir tidak punya candle di sebelah kanannya, sehingga
-           tidak bisa memenuhi syarat "lebih rendah/tinggi dari wing candle di kanan".
-           Ini bukan karena belum closed, tapi karena keterbatasan definisi swing.
-        3. Cari candle yang low/high-nya adalah minimum/maksimum lokal
-        4. Kembalikan swing terdekat (yang paling baru) — iterate dari akhir
-
     Parameter:
         df       : DataFrame yang sudah punya kolom 'low' dan 'high'
-                   (semua candle sudah closed, jaminan dari get_candles())
-        arah     : "BUY"  → cari swing LOW (untuk referensi SL di bawah entry)
-                   "SELL" → cari swing HIGH (untuk referensi SL di atas entry)
+        arah     : "BUY"  → cari swing LOW
+                   "SELL" → cari swing HIGH
         lookback : Jumlah candle ke belakang yang ditelusuri
         wing     : Jumlah candle di kiri & kanan untuk konfirmasi swing
 
@@ -113,140 +100,88 @@ def find_nearest_swing(
         float → harga swing yang ditemukan (nilai low atau high)
         None  → tidak ditemukan swing dalam lookback window
     """
-    # Kita butuh minimal (lookback + 2*wing) candle agar ada cukup data
     min_data = lookback + wing * 2 + 1
 
     if len(df) < min_data:
-        # Data tidak cukup — kembalikan None agar caller pakai fallback ATR
         return None
 
-    # Ambil window data:
-    # - Kecualikan candle paling akhir ([-1]) karena alasan teknikal swing:
-    #   Sebuah candle bisa jadi swing HANYA jika ada `wing` candle di kiri
-    #   DAN kanan yang lebih tinggi/rendah. Candle terakhir di DataFrame
-    #   tidak punya candle di sebelah kanannya sama sekali, sehingga
-    #   tidak bisa memenuhi definisi swing.
-    #   (Bukan karena belum closed — data sudah dijamin closed semua dari
-    #   get_candles() dengan start_pos=1.)
-    # - Ambil lebih banyak dari lookback agar candle di tepi window tetap
-    #   punya cukup tetangga untuk validasi swing
     data = df.iloc[-(lookback + wing * 2):-1].copy()
     n    = len(data)
+    col  = "low" if arah == "BUY" else "high"
 
-    # Pilih kolom yang relevan berdasarkan arah
-    col = "low" if arah == "BUY" else "high"
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Iterasi dari candle TERBARU ke TERLAMA (mencari swing terdekat dulu)
-    # Valid range: wing ≤ i ≤ (n - 1 - wing)
-    # → butuh wing candle di kiri (i-wing:i) dan kanan (i+1:i+wing+1)
-    # ─────────────────────────────────────────────────────────────────────────
     for i in range(n - 1 - wing, wing - 1, -1):
-        # Ambil nilai candle ke-i dan tetangganya
         window_slice = data[col].iloc[i - wing : i + wing + 1]
         val          = data[col].iloc[i]
 
         if arah == "BUY":
-            # Swing LOW: nilai ini adalah minimum lokal dalam window
             if val == window_slice.min():
                 return float(val)
-
         else:  # SELL
-            # Swing HIGH: nilai ini adalah maksimum lokal dalam window
             if val == window_slice.max():
                 return float(val)
 
-    # Tidak ada swing ditemukan dalam lookback window
     return None
 
 
 # =============================================================================
-# FUNGSI 2: KALKULASI SL DAN TP (FUNGSI UTAMA)
+# FUNGSI 2: KALKULASI SL DAN TP (FUNGSI UTAMA DEGAN ATR CLAMP)
 # =============================================================================
 
 def calculate_sl_tp(
-    df             : pd.DataFrame,
-    entry          : float,
-    arah           : str,
-    rrr_min        : float = RRR_MIN_DEFAULT,
-    atr_multiplier : float = ATR_MULTIPLIER,
-    swing_lookback : int   = SWING_LOOKBACK,
-    swing_buffer   : float = SWING_BUFFER,
-    tick_info      : dict | None = None,
+    df                  : pd.DataFrame,
+    entry               : float,
+    arah                : str,
+    profile             : str = "scalp_m5",
+    rrr_min             : float | None = None,
+    atr_multiplier      : float | None = None,
+    swing_lookback      : int | None = None,
+    swing_wing          : int | None = None,
+    swing_clamp_min_atr : float | None = None,
+    swing_clamp_max_atr : float | None = None,
+    swing_buffer        : float | None = None,
+    tick_info           : dict | None = None,
 ) -> dict:
     """
-    Hitung SL dan TP menggunakan pendekatan Hybrid ATR + Swing.
+    Hitung SL dan TP menggunakan pendekatan ATR-Clamped Swing.
 
     ALUR KALKULASI:
-        1. Tentukan harga entry yang sebenarnya:
-             Jika tick_info ada → pakai ask (BUY) atau bid (SELL) dari tick real-time
-             Jika tick_info = None → pakai parameter 'entry' (biasanya close, backward-compat)
-        2. Ambil nilai ATR terbaru dari DataFrame (sudah dihitung di indicators.py)
-        3. Hitung SL versi ATR:
-             BUY : sl_atr = entry − (atr_multiplier × atr)
-             SELL: sl_atr = entry + (atr_multiplier × atr)
-        4. Cari swing terdekat (swing low untuk BUY, swing high untuk SELL)
-        5. Hitung SL versi Swing (jika swing ditemukan):
-             BUY : sl_swing = swing_level − swing_buffer
-             SELL: sl_swing = swing_level + swing_buffer
-        6. Pilih SL final yang LEBIH JAUH dari entry (lebih konservatif):
-             BUY : sl_final = min(sl_atr, sl_swing)  ← lebih RENDAH = lebih jauh
-             SELL: sl_final = max(sl_atr, sl_swing)  ← lebih TINGGI = lebih jauh
-        7. Hitung TP: TP = entry ± (jarak_SL × rrr_min)
-        8. Hitung spread & rrr_after_spread jika tick_info tersedia
-
-    Parameter:
-        df             : DataFrame yang sudah melewati run_all_indicators()
-                         — harus punya kolom 'atr_14', 'high', 'low'
-        entry          : Harga entry fallback (dipakai jika tick_info = None).
-                         Biasanya close candle terbaru.
-        arah           : "BUY" atau "SELL"
-        rrr_min        : RRR minimum. TP = entry ± (jarak_SL × rrr_min)
-        atr_multiplier : Pengali ATR untuk SL minimum
-        swing_lookback : Berapa candle ditelusuri untuk cari swing
-        swing_buffer   : Buffer dollar di luar swing level
-        tick_info      : Dict dengan key 'ask' dan 'bid' dari mt5.symbol_info_tick().
-                         Jika diberikan:
-                           - BUY  → entry pakai ask (harga eksekusi nyata)
-                           - SELL → entry pakai bid
-                           - spread, rrr_after_spread dihitung dan dimasukkan ke output
-                         Jika None: fallback ke parameter 'entry' (backward-compatible).
+        1. Muat parameter default dari RISK_PROFILES[profile]. Parameter yang
+           dilewatkan secara eksplisit akan me-override nilai default profile.
+        2. Tentukan harga entry eksekusi (ask untuk BUY, bid untuk SELL jika tick_info ada).
+        3. Cari level swing raw (swing low untuk BUY, swing high untuk SELL).
+        4. Jika swing ditemukan:
+             - Jarak raw = entry - (swing_low - buffer) [BUY] atau (swing_high + buffer) - entry [SELL]
+             - Clamp jarak raw ke rentang [min_dist, max_dist] di mana:
+                 min_dist = swing_clamp_min_atr × ATR
+                 max_dist = swing_clamp_max_atr × ATR
+             - SL final = entry - dist_clamped [BUY] atau entry + dist_clamped [SELL]
+        5. Jika swing tidak ditemukan:
+             - Fallback ke ATR: jarak_sl = atr_multiplier × ATR
+        6. TP = entry ± (jarak_sl × rrr_min)
 
     Return:
-        dict berisi:
-            "valid"            : bool   — False jika data tidak mencukupi
-            "entry"            : float  — harga entry yang dipakai (ask/bid/close)
-            "entry_type"       : str    — "ASK", "BID", atau "CLOSE" (untuk audit)
-            "sl"               : float  — harga Stop Loss final
-            "tp"               : float  — harga Take Profit
-            "rrr"              : float  — RRR aktual
-            "jarak_sl"         : float  — jarak absolut entry ke SL (dalam dollar)
-            "jarak_tp"         : float  — jarak absolut entry ke TP (dalam dollar)
-            "sl_method"        : str    — "SWING" atau "ATR"
-            "atr_value"        : float  — nilai ATR aktual
-            "sl_atr_level"     : float  — SL versi ATR (selalu dihitung, untuk referensi)
-            "sl_swing_raw"     : float|None — harga swing yang ditemukan (sebelum buffer)
-            "sl_swing_level"   : float|None — SL versi swing (setelah buffer)
-            "spread"           : float|None — lebar spread (ask-bid) saat evaluasi.
-                                              None jika tick_info tidak diberikan.
-            "rrr_after_spread" : float|None — RRR setelah memperhitungkan spread sebagai
-                                              biaya di kedua sisi (entry + exit).
-                                              None jika spread tidak tersedia.
-            "pesan"            : str    — penjelasan singkat bagaimana SL dihitung
+        dict audit lengkap berisi SL, TP, RRR, audit clamp, dan status metode SL.
     """
+    # ── Resolve parameter dari Profile & Overrides ───────────────────────────
+    p = RISK_PROFILES.get(profile, RISK_PROFILES["scalp_m5"])
+
+    rrr_min             = rrr_min             if rrr_min             is not None else p.get("rrr_min", RRR_MIN_DEFAULT)
+    atr_multiplier      = atr_multiplier      if atr_multiplier      is not None else p.get("atr_multiplier", ATR_MULTIPLIER)
+    swing_lookback      = swing_lookback      if swing_lookback      is not None else p.get("swing_lookback", SWING_LOOKBACK)
+    swing_wing          = swing_wing          if swing_wing          is not None else p.get("swing_wing", SWING_WING)
+    swing_clamp_min_atr = swing_clamp_min_atr if swing_clamp_min_atr is not None else p.get("swing_clamp_min_atr", SWING_CLAMP_MIN_ATR)
+    swing_clamp_max_atr = swing_clamp_max_atr if swing_clamp_max_atr is not None else p.get("swing_clamp_max_atr", SWING_CLAMP_MAX_ATR)
+    swing_buffer        = swing_buffer        if swing_buffer        is not None else p.get("swing_buffer", SWING_BUFFER)
+
     _validate_inputs(df, entry, arah, rrr_min)
 
     atr_col = f"atr_{ATR_PERIOD}"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 1: Tentukan harga entry yang sebenarnya
+    # LANGKAH 1: Tentukan harga entry eksekusi
     # ─────────────────────────────────────────────────────────────────────────
-    # Jika tick_info diberikan: pakai harga ask (BUY) atau bid (SELL) dari tick real-time.
-    # Ini mencerminkan harga eksekusi nyata, bukan harga close historis.
-    # Jika tidak ada (None): fallback ke parameter 'entry' (backward-compatible).
-
-    spread     = None  # default: spread tidak diketahui
-    entry_type = "CLOSE"  # default
+    spread     = None
+    entry_type = "CLOSE"
 
     if tick_info is not None:
         ask = tick_info.get("ask")
@@ -254,99 +189,83 @@ def calculate_sl_tp(
 
         if ask is not None and bid is not None and ask > 0 and bid > 0:
             spread = round(ask - bid, 5)
-
             if arah == "BUY":
-                entry = float(ask)   # BUY dieksekusi di harga ask
+                entry = float(ask)
                 entry_type = "ASK"
-            else:  # SELL
-                entry = float(bid)   # SELL dieksekusi di harga bid
+            else:
+                entry = float(bid)
                 entry_type = "BID"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 2: Ambil nilai ATR terbaru
+    # LANGKAH 2: Ambil ATR & Hitung level referensi ATR
     # ─────────────────────────────────────────────────────────────────────────
-    # Gunakan iloc[-1] = nilai dari candle paling baru
     atr_value = float(df[atr_col].iloc[-1])
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 2: Hitung SL versi ATR (selalu dihitung sebagai fallback)
-    # ─────────────────────────────────────────────────────────────────────────
     if arah == "BUY":
         sl_atr = entry - (atr_multiplier * atr_value)
-    else:  # SELL
+    else:
         sl_atr = entry + (atr_multiplier * atr_value)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 3: Cari swing terdekat dan hitung SL versi Swing
+    # LANGKAH 3: Deteksi Swing & Logika ATR Clamp
     # ─────────────────────────────────────────────────────────────────────────
-    swing_raw   = find_nearest_swing(df, arah, lookback=swing_lookback)
-    sl_swing    = None
+    swing_raw = find_nearest_swing(df, arah, lookback=swing_lookback, wing=swing_wing)
+
+    sl_swing          = None
+    sl_swing_clamped  = False
+    clamp_reason      = None
+
+    min_dist = swing_clamp_min_atr * atr_value
+    max_dist = swing_clamp_max_atr * atr_value
 
     if swing_raw is not None:
-        # Tambah buffer di luar swing level
-        # BUY : SL sedikit di BAWAH swing low → swing_raw - buffer
-        # SELL: SL sedikit di ATAS swing high → swing_raw + buffer
         if arah == "BUY":
             sl_swing = swing_raw - swing_buffer
+            dist_raw = entry - sl_swing
         else:  # SELL
             sl_swing = swing_raw + swing_buffer
+            dist_raw = sl_swing - entry
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 4: Pilih SL final — yang LEBIH JAUH dari entry
-    # ─────────────────────────────────────────────────────────────────────────
-    #
-    # ⚠️  LOGIKA KRITIS — baca ini dulu sebelum mengubah kode:
-    #
-    #   Untuk BUY:  SL ada di BAWAH entry (nilai lebih kecil dari entry)
-    #               "Lebih jauh" = lebih rendah = nilai LEBIH KECIL → pakai min()
-    #               min(sl_atr, sl_swing) memilih level yang LEBIH RENDAH
-    #
-    #   Untuk SELL: SL ada di ATAS entry (nilai lebih besar dari entry)
-    #               "Lebih jauh" = lebih tinggi = nilai LEBIH BESAR → pakai max()
-    #               max(sl_atr, sl_swing) memilih level yang LEBIH TINGGI
-    #
-    #   Menggunakan max() untuk BUY adalah SALAH — itu justru memilih SL
-    #   yang lebih dekat ke entry (lebih tinggi dari sl_atr), lebih mudah
-    #   kena hit, dan tidak menghormati struktur market.
+        # Clamp distance ke range [min_dist, max_dist]
+        if dist_raw < min_dist:
+            dist_final       = min_dist
+            sl_swing_clamped = True
+            clamp_reason     = "MIN_CAP"
+        elif dist_raw > max_dist:
+            dist_final       = max_dist
+            sl_swing_clamped = True
+            clamp_reason     = "MAX_CAP"
+        else:
+            dist_final       = dist_raw
+            sl_swing_clamped = False
+            clamp_reason     = None
 
-    if sl_swing is not None:
+        sl_method = "SWING"
         if arah == "BUY":
-            # Pilih yang lebih RENDAH (lebih jauh di bawah entry)
-            sl_final   = min(sl_atr, sl_swing)
-            sl_method  = "SWING" if sl_swing <= sl_atr else "ATR"
-        else:  # SELL
-            # Pilih yang lebih TINGGI (lebih jauh di atas entry)
-            sl_final   = max(sl_atr, sl_swing)
-            sl_method  = "SWING" if sl_swing >= sl_atr else "ATR"
+            sl_final = entry - dist_final
+        else:
+            sl_final = entry + dist_final
     else:
-        # Tidak ada swing — fallback ke ATR
-        sl_final  = sl_atr
-        sl_method = "ATR"
+        # Fallback ke ATR jika swing tidak ditemukan
+        dist_final       = atr_multiplier * atr_value
+        sl_final         = sl_atr
+        sl_method        = "ATR"
+        sl_swing_clamped = False
+        clamp_reason     = None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 5: Hitung TP berdasarkan RRR minimum
+    # LANGKAH 4: Hitung TP & RRR
     # ─────────────────────────────────────────────────────────────────────────
-    jarak_sl = abs(entry - sl_final)   # selalu positif
+    jarak_sl = abs(entry - sl_final)
 
     if arah == "BUY":
         tp = entry + (jarak_sl * rrr_min)
-    else:  # SELL
+    else:
         tp = entry - (jarak_sl * rrr_min)
 
-    jarak_tp = abs(tp - entry)         # selalu positif
+    jarak_tp = abs(tp - entry)
     rrr      = jarak_tp / jarak_sl if jarak_sl > 0 else 0.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 6: Hitung RRR setelah memperhitungkan spread (cost transaksi)
-    # ─────────────────────────────────────────────────────────────────────────
-    # Spread adalah biaya yang ditanggung dua kali:
-    #   - Saat entry: kita membeli di ask (lebih mahal dari bid)
-    #   - Saat exit : kita menutup posisi dan terkena spread lagi
-    # RRR "bersih" memperhitungkan biaya ini:
-    #   BUY  : profit bersih = jarak_tp - spread
-    #          risiko kotor  = jarak_sl + spread  (SL kena hit dari harga yang sudah lebih atas)
-    #   SELL : simetris
-    # Jika spread tidak diketahui (tick_info=None), field ini None.
     rrr_after_spread = None
     if spread is not None and jarak_sl > 0:
         effective_profit = max(0.0, jarak_tp - spread)
@@ -357,18 +276,17 @@ def calculate_sl_tp(
     # Susun pesan audit
     # ─────────────────────────────────────────────────────────────────────────
     if sl_method == "SWING" and swing_raw is not None:
+        clamp_str = f" [CLAMPED: {clamp_reason} ({min_dist:.2f} - {max_dist:.2f} USD)]" if sl_swing_clamped else ""
         pesan = (
             f"SL dari swing {'low' if arah == 'BUY' else 'high'} @ {swing_raw:.2f} "
-            f"{'−' if arah == 'BUY' else '+'} buffer {swing_buffer:.2f} = {sl_final:.2f} "
-            f"(ATR level {sl_atr:.2f} lebih dekat ke entry, swing dipakai)"
+            f"{'−' if arah == 'BUY' else '+'} buffer {swing_buffer:.2f} = {sl_final:.2f}{clamp_str} "
+            f"(ATR {atr_value:.2f}, clamp range: [{min_dist:.2f}, {max_dist:.2f}])"
         )
     else:
-        alasan_fallback = "tidak ada swing ditemukan" if swing_raw is None else \
-                          f"ATR lebih jauh dari swing ({sl_atr:.2f} vs {sl_swing:.2f})"
         pesan = (
             f"SL dari ATR: {entry:.2f} "
             f"{'−' if arah == 'BUY' else '+'} ({atr_multiplier}×{atr_value:.2f}) = {sl_final:.2f} "
-            f"({alasan_fallback})"
+            f"(tidak ada swing ditemukan dalam lookback {swing_lookback})"
         )
 
     return {
@@ -381,6 +299,8 @@ def calculate_sl_tp(
         "jarak_sl"         : round(jarak_sl, 2),
         "jarak_tp"         : round(jarak_tp, 2),
         "sl_method"        : sl_method,
+        "sl_swing_clamped" : sl_swing_clamped,
+        "clamp_reason"     : clamp_reason,
         "atr_value"        : round(atr_value, 2),
         "sl_atr_level"     : round(sl_atr,    2),
         "sl_swing_raw"     : round(swing_raw, 2) if swing_raw is not None else None,
@@ -389,6 +309,7 @@ def calculate_sl_tp(
         "rrr_after_spread" : rrr_after_spread,
         "pesan"            : pesan,
     }
+
 
 
 # =============================================================================

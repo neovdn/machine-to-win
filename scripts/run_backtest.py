@@ -147,6 +147,12 @@ Contoh:
                   "288 M5 = ~24 jam trading time. (default: 288)",
     )
     bt_group.add_argument(
+        "--rrr-min",
+        type    = float,
+        default = 1.3,
+        help    = "Minimum Risk-to-Reward Ratio (default: 1.3).",
+    )
+    bt_group.add_argument(
         "--warm-up",
         type    = int,
         default = 100,

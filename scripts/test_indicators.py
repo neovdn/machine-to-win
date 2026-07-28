@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from engine.data_fetcher import initialize_mt5, get_candles, shutdown_mt5
 from engine.indicators import run_all_indicators, get_latest_signals
 import MetaTrader5 as mt5  # untuk ambil waktu broker sebagai referensi validasi
+from datetime import datetime, timezone  # untuk validasi waktu UTC sejati
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,13 +81,11 @@ if df is None:
     shutdown_mt5()
     sys.exit(1)
 
-# Ambil waktu server broker SEBELUM shutdown — dipakai untuk validasi candle closed.
-# Kita ambil dari tick terbaru (mt5.symbol_info_tick) bukan datetime.now(),
-# karena broker bisa pakai timezone berbeda dari komputer (misalnya UTC+3).
-# Dengan pakai sumber yang sama (MT5), perbandingan selalu akurat.
-_tick = mt5.symbol_info_tick("XAUUSD")
-broker_now_unix = _tick.time  # detik (integer), timezone broker
-del _tick
+# Ambil waktu sekarang dalam UTC sejati SEBELUM shutdown.
+# Setelah fix timezone di data_fetcher, df.index sudah UTC sejati.
+# Maka perbandingan "sekarang vs candle terbaru" harus pakai UTC sejati juga.
+# Kita tidak lagi membutuhkan broker_now_unix — waktu UTC komputer sudah cukup.
+now_utc = datetime.now(timezone.utc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,49 +142,41 @@ print()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VALIDASI CANDLE CLOSED
-# Verifikasi bahwa candle terbaru bukan candle yang sedang berjalan.
-# Caranya: hitung selisih waktu antara candle terbaru dan waktu sekarang.
-# Untuk M5, candle yang sudah closed minimal berumur 5 menit dari waktu open-nya.
-# Jika selisih < 5 menit, berarti sistem mungkin masih pakai candle aktif.
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("=" * 65)
 print("  ✅  VALIDASI: APAKAH SISTEM SUDAH SKIP CANDLE AKTIF?")
 print("=" * 65)
 
-# ── Cara kerja validasi ini ──────────────────────────────────────────────────
-# Masalah: broker MT5 menggunakan timezone server (UTC+3/EEST di musim panas,
-# UTC+2/EET di musim dingin). Timestamp candle dan tick KEDUANYA pakai
-# timezone yang sama, sehingga kita bisa bandingkan langsung tanpa
-# perlu tahu berapa offset-nya. Timezone-agnostic = selalu akurat.
+# ── Cara kerja validasi ini (setelah fix timezone) ───────────────────────────
+# df.index[-1] sekarang berisi waktu UTC sejati (sudah dikoreksi offset broker
+# di data_fetcher.py). Kita bandingkan langsung dengan now_utc yang juga UTC.
 #
-# broker_now_unix : waktu sekarang versi broker (integer, detik)
-# candle open     : waktu pembukaan candle (integer, detik) → dari df.index
-# candle close    : candle open + 300 detik (5 menit × 60)
-#
-# Jika broker_now > candle_close → candle sudah CLOSED ✓
-# ─────────────────────────────────────────────────────────────────
-
+# now_utc        : waktu sekarang (UTC sejati, diambil sebelum shutdown)
+# candle_open    : waktu pembukaan candle (UTC sejati, dari df.index[-1])
+# candle_close   : candle_open + 300 detik (5 menit × 60)
+# df.index[-1] sudah UTC sejati (setelah fix timezone di data_fetcher.py)
+# Kita pakai .timestamp() untuk konversi ke detik integer — ini benar karena
+# pandas Timestamp yang tz-aware mengembalikan epoch UTC saat dipanggil .timestamp()
+candle_open_ts    = df.index[-1]
+candle_open_unix  = int(candle_open_ts.timestamp())
 TF_SECONDS = 5 * 60  # timeframe M5 = 300 detik
-
-# Konversi timestamp candle (Pandas Timestamp) ke detik integer
-# .value = nanoseconds → bagi 1e9 = seconds
-candle_open_unix  = int(df.index[-1].value // 1_000_000_000)  # candle terakhir (closed)
-candle_close_unix = candle_open_unix + TF_SECONDS              # perkiraan waktu tutup
+candle_close_unix = candle_open_unix + TF_SECONDS
+now_unix          = int(now_utc.timestamp())
 
 # Selisih dalam detik (positif = sudah lewat, negatif = belum terjadi)
-sudah_closed_detik = broker_now_unix - candle_close_unix
+sudah_closed_detik = now_unix - candle_close_unix
 sudah_closed_menit = sudah_closed_detik / 60
 
-print(f"  Referensi waktu broker : unix = {broker_now_unix}")
-print(f"  Candle terbaru open    : unix = {candle_open_unix}")
-print(f"  Perkiraan candle close : unix = {candle_close_unix}  (open + {TF_SECONDS}s)")
-print(f"  Selisih (now - close)  : {sudah_closed_detik} detik  = {sudah_closed_menit:.1f} menit")
+print(f"  Referensi waktu sekarang (UTC)  : {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+print(f"  Candle terbaru open (UTC sejati) : {candle_open_ts}")
+print(f"  Perkiraan candle close           : unix = {candle_close_unix}  (open + {TF_SECONDS}s)")
+print(f"  Selisih (now - close)            : {sudah_closed_detik} detik  = {sudah_closed_menit:.1f} menit")
 print()
 
 if sudah_closed_detik > 0:
     print(f"  ✅ TERBUKTI CLOSED! Candle terbaru sudah tutup {sudah_closed_menit:.1f} menit yang lalu.")
-    print(f"     Waktu broker sekarang ({broker_now_unix}) > waktu tutup candle ({candle_close_unix}).")
+    print(f"     Waktu UTC sekarang ({now_unix}) > waktu tutup candle ({candle_close_unix}).")
     print(f"     Sistem TIDAK menganalisis candle yang sedang berjalan.")
     print(f"     Keputusan trading tidak akan repainting.")
 elif sudah_closed_detik == 0:

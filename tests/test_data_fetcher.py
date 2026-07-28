@@ -17,11 +17,13 @@ import os
 import pandas as pd
 import numpy as np
 import pytest
+from unittest.mock import patch, MagicMock
+from datetime import timedelta, timezone, datetime as dt
 
 # Tambahkan root project ke path agar bisa import modul engine
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from engine.data_fetcher import validate_data, TIMEFRAME_MAP
+from engine.data_fetcher import validate_data, TIMEFRAME_MAP, get_broker_utc_offset
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,15 +45,19 @@ def mock_df():
         freq="5min",  # Setiap 5 menit (M5)
         tz="UTC"
     )
+    # Setiap baris dibuat konsisten: low = min(open,close)-0.5, high = max(open,close)+0.5
+    # Sehingga selalu: high >= open, high >= close, low <= open, low <= close
+    opens  = [2050.0, 2051.5, 2049.8, 2051.0, 2050.5,
+               2051.0, 2051.5, 2054.5, 2052.0, 2054.0]
+    closes = [2051.5, 2049.8, 2051.0, 2050.5, 2051.8,
+               2051.0, 2052.0, 2055.0, 2053.5, 2056.0]
+    highs  = [max(o, c) + 0.5 for o, c in zip(opens, closes)]
+    lows   = [min(o, c) - 0.5 for o, c in zip(opens, closes)]
     data = {
-        "open":        [2050.0, 2051.5, 2049.8, 2052.0, 2050.5,
-                        2053.0, 2051.0, 2054.5, 2052.0, 2055.0],
-        "high":        [2052.0, 2053.0, 2051.5, 2053.5, 2052.0,
-                        2054.5, 2053.0, 2056.0, 2054.0, 2056.5],
-        "low":         [2049.0, 2050.0, 2048.5, 2050.5, 2049.0,
-                        2051.5, 2049.5, 2053.0, 2051.0, 2053.5],
-        "close":       [2051.5, 2049.8, 2052.0, 2050.5, 2053.0,
-                        2051.0, 2054.5, 2052.0, 2055.0, 2054.0],
+        "open":        opens,
+        "high":        highs,
+        "low":         lows,
+        "close":       closes,
         "tick_volume": [120, 95, 145, 88, 167, 112, 134, 98, 201, 156],
     }
     df = pd.DataFrame(data, index=timestamps)
@@ -121,3 +127,50 @@ def test_mock_df_ohlc_logic(mock_df):
     assert (mock_df["high"] >= mock_df["close"]).all(), "Ada high < close"
     assert (mock_df["low"]  <= mock_df["open"]).all(),  "Ada low > open"
     assert (mock_df["low"]  <= mock_df["close"]).all(), "Ada low > close"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGRESSION TEST: get_broker_utc_offset (Item 1 Fase 0 — Fix Timezone)
+# ─────────────────────────────────────────────────────────────────────────────
+# Test ini menggunakan mock agar tidak membutuhkan koneksi MT5 nyata.
+# Mock mensimulasikan tick.time yang 3 jam LEBIH MAJU dari UTC (EEST = UTC+3).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_get_broker_utc_offset_detects_eest():
+    """
+    get_broker_utc_offset() harus mendeteksi UTC+3 (EEST) dengan benar.
+    Simulasi: tick.time = now_utc_unix + 10800 (3 jam = EEST).
+    """
+    fixed_utc = dt(2026, 7, 28, 9, 0, 0, tzinfo=timezone.utc)
+    tick_unix  = int(fixed_utc.timestamp()) + 3 * 3600  # broker 3 jam lebih maju
+
+    mock_tick = MagicMock()
+    mock_tick.time = tick_unix
+
+    with patch("engine.data_fetcher.mt5.symbol_info_tick", return_value=mock_tick), \
+         patch("engine.data_fetcher.datetime") as mock_dt:
+        # Mock datetime.now(UTC) agar return fixed_utc
+        mock_dt.now.return_value = fixed_utc
+        mock_dt.side_effect = lambda *args, **kwargs: dt(*args, **kwargs)
+
+        offset = get_broker_utc_offset("XAUUSD")
+
+    assert isinstance(offset, timedelta), "offset harus bertipe timedelta"
+    assert offset == timedelta(hours=3), (
+        f"Expected timedelta(hours=3), got {offset} "
+        f"— get_broker_utc_offset tidak mendeteksi EEST (UTC+3) dengan benar"
+    )
+
+
+def test_get_broker_utc_offset_fallback_when_tick_none():
+    """
+    get_broker_utc_offset() harus return timedelta(0) jika tick tidak tersedia,
+    bukan crash — ini menjaga kompatibilitas jika MT5 tidak aktif.
+    """
+    with patch("engine.data_fetcher.mt5.symbol_info_tick", return_value=None):
+        offset = get_broker_utc_offset("XAUUSD")
+
+    assert offset == timedelta(0), (
+        f"Expected timedelta(0) saat tick None, got {offset} "
+        f"— fallback harus aman (tidak crash dan return offset=0)"
+    )

@@ -27,12 +27,32 @@ JAMINAN CANDLE CLOSED:
     KONSEKUENSI DESAIN:
         df.iloc[-1] di seluruh codebase = candle CLOSED terakhir.
         Bukan candle yang sedang terbentuk.
+
+CATATAN TIMEZONE (PENTING — baca sebelum memodifikasi kode ini):
+    mt5.copy_rates_from_pos() dan copy_rates_range() mengembalikan field
+    'time' dalam TIMEZONE SERVER BROKER, BUKAN UTC sejati.
+    Misalnya broker dengan timezone EEST (UTC+3, musim panas) akan
+    mengembalikan timestamp 3 jam LEBIH MAJU dari UTC.
+
+    Jika langsung di-parse dengan pd.to_datetime(unit='s', utc=True),
+    label timezone-nya akan salah: label menunjukkan +00:00 (UTC) tapi
+    nilai jam yang dikandung adalah jam broker lokal (UTC+3).
+
+    SOLUSI: get_broker_utc_offset() mendeteksi offset broker secara
+    DINAMIS saat runtime dengan membandingkan mt5.symbol_info_tick().time
+    vs datetime.now(UTC). Offset ini kemudian dipakai untuk mengoreksi
+    semua timestamp candle menjadi UTC sejati.
+
+    KENAPA DINAMIS (bukan hardcode -3 jam):
+        Broker Eropa Timur berganti antara EET (UTC+2, Oktober–Maret)
+        dan EEST (UTC+3, Maret–Oktober) dua kali setahun — DST otomatis.
+        Hardcode nilai offset akan salah selama separuh tahun.
 """
 
 import os
 import MetaTrader5 as mt5
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 
@@ -55,6 +75,63 @@ TIMEFRAME_MAP = {
     "H4":  mt5.TIMEFRAME_H4,   # 4 jam
     "D1":  mt5.TIMEFRAME_D1,   # 1 hari
 }
+
+
+# =============================================================================
+# DETEKSI TIMEZONE BROKER (DINAMIS)
+# =============================================================================
+
+def get_broker_utc_offset(symbol: str = "XAUUSD") -> timedelta:
+    """
+    Deteksi offset timezone broker MT5 secara dinamis saat runtime.
+
+    CARA KERJA:
+        1. Ambil timestamp tick terbaru dari MT5 (mt5.symbol_info_tick)
+        2. Bandingkan dengan datetime.now(UTC) — waktu UTC sejati komputer
+        3. Selisih keduanya (dibulatkan ke jam terdekat) = offset broker
+
+    KENAPA BISA DETEKSI:
+        Broker menyimpan 'tick.time' sebagai detik sejak epoch (1970-01-01),
+        TAPI nilai jam yang dikandung adalah jam lokal server broker.
+        Contoh: jika broker UTC+3 dan sekarang 09:00 UTC:
+            - datetime.now(UTC) → 09:00 UTC (unix = X)
+            - tick.time         → 12:00 (jam broker) → unix = X + 10800
+            - selisih           → +10800 detik = +3 jam = offset broker
+
+    AKURASI:
+        Pembulatan ke jam terdekat karena broker selalu UTC±N jam bulat
+        (EET=UTC+2, EEST=UTC+3). Latency network / drift kecil diabaikan.
+
+    Parameter:
+        symbol : Nama instrumen untuk mengambil tick (default: "XAUUSD").
+                 Gunakan simbol yang selalu aktif agar tick tersedia.
+
+    Return:
+        timedelta offset broker terhadap UTC.
+        Positif = broker LEBIH MAJU dari UTC (misal EEST = timedelta(hours=3)).
+        timedelta(0) jika tick tidak tersedia (fallback aman — tidak crash).
+    """
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            print(f"⚠️  get_broker_utc_offset: tick '{symbol}' tidak tersedia, offset=0")
+            return timedelta(0)
+
+        unix_tick    = tick.time                         # jam broker (detik sejak epoch)
+        unix_utc_now = datetime.now(timezone.utc).timestamp()  # UTC sejati (detik)
+
+        # Selisih dalam detik → bulatkan ke jam terdekat
+        delta_secs  = unix_tick - unix_utc_now
+        offset_hours = round(delta_secs / 3600)          # bulatkan ke jam bulat
+        offset       = timedelta(hours=offset_hours)
+
+        print(f"🕐 Offset broker terdeteksi: UTC{offset_hours:+d} "
+              f"({'EEST' if offset_hours == 3 else 'EET' if offset_hours == 2 else f'UTC{offset_hours:+d}'})")
+        return offset
+
+    except Exception as e:
+        print(f"⚠️  get_broker_utc_offset gagal ({e}), menggunakan offset=0")
+        return timedelta(0)
 
 
 def initialize_mt5() -> bool:
@@ -195,10 +272,14 @@ def get_candles(
     # DataFrame adalah "tabel data" yang mudah dimanipulasi dan dihitung
     df = pd.DataFrame(rates)
 
-    # Kolom 'time' dari MT5 berformat Unix timestamp (detik sejak 1970-01-01)
-    # Konversi ke format datetime yang manusia bisa baca
-    # utc=True karena MT5 selalu menggunakan UTC untuk timestamp
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+    # ── Koreksi timezone broker → UTC sejati ──────────────────────────
+    # Langkah 1: Parse timestamp sebagai UTC (label awal — belum benar)
+    #   pd.to_datetime(unit='s', utc=True) akan label +00:00 padahal
+    #   nilai jam yang dikandung = jam broker (mis. UTC+3).
+    # Langkah 2: Kurangi offset broker untuk mendapat UTC sejati.
+    #   Setelah dikurangi, nilai jam dan label timezone KEDUANYA benar.
+    broker_offset = get_broker_utc_offset(symbol)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True) - broker_offset
 
     # Pilih hanya kolom yang relevan untuk analisis kita
     # (MT5 juga punya kolom 'spread' dan 'real_volume' yang tidak kita butuhkan sekarang)
@@ -208,7 +289,7 @@ def get_candles(
     df = df.set_index("time")
 
     print(f"✅ Data berhasil ditarik: {len(df)} candle (semua sudah closed)")
-    print(f"   Candle terbaru: {df.index[-1]}")
+    print(f"   Candle terbaru (UTC sejati): {df.index[-1]}")
     return df
 
 
@@ -327,12 +408,17 @@ def get_candles_range(
         return None
 
     df = pd.DataFrame(rates)
-    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+    # Koreksi timezone broker → UTC sejati (sama dengan get_candles())
+    # Lihat docstring modul untuk penjelasan lengkap tentang kenapa ini diperlukan.
+    broker_offset = get_broker_utc_offset(symbol)
+    df["time"] = pd.to_datetime(df["time"], unit="s", utc=True) - broker_offset
+
     df = df[["time", "open", "high", "low", "close", "tick_volume"]]
     df = df.set_index("time")
 
     print(f"✅ Data berhasil ditarik: {len(df):,} candle")
-    print(f"   Rentang aktual: {df.index[0]} → {df.index[-1]}")
+    print(f"   Rentang aktual (UTC sejati): {df.index[0]} → {df.index[-1]}")
     return df
 
 

@@ -78,6 +78,14 @@ MAX_FORWARD_CANDLES = 288
 # Trade dengan jarak SL di bawah ini diabaikan — kemungkinan anomali data.
 MIN_SL_DISTANCE = 0.10
 
+# Spread default untuk cost model backtest (dalam USD).
+# Broker menggunakan spread floating minimum 0.5 pip untuk XAUUSD.
+# Konvensi: 1 pip XAUUSD = $1.00 → 0.5 pip = $0.50.
+# Nilai ini dipakai jika caller tidak melewatkan spread_pts secara eksplisit.
+# Catatan: spread nyata bisa lebih besar saat news (hingga 12 pip).
+# Fase 0 pakai spread konstan sebagai estimasi konservatif biaya minimum.
+DEFAULT_SPREAD_PTS = 0.50
+
 
 # =============================================================================
 # BAGIAN 1: VALIDASI ZERO LOOK-AHEAD (EMPIRIS)
@@ -378,12 +386,20 @@ def simulate_trade_outcome(
                 "ambiguous_candle" : False,
             }
 
-    # Tidak ada hit dalam window max_candles
+    # Tidak ada hit dalam window max_candles — NO_HIT (Opsi A: mark-to-market)
+    # Simpan harga close candle TERAKHIR di window sebagai referensi exit MTM.
+    # Jika scan_end > scan_start, ambil candle terakhir yang di-scan.
+    # Jika data habis (scan_end == scan_start), gunakan entry price sebagai fallback.
+    last_j          = scan_end - 1 if scan_end > scan_start else entry_idx
+    exit_price_mtm  = float(df_m5_full.iloc[last_j]["close"])
+    exit_time_mtm   = str(df_m5_full.index[last_j]) if scan_end > scan_start else None
+
     return {
         "outcome"          : "NO_HIT",
         "candles_held"     : scan_end - scan_start,
-        "exit_time"        : None,
-        "exit_price"       : None,
+        "exit_time"        : exit_time_mtm,
+        "exit_price"       : None,           # SL/TP formal tidak tersentuh
+        "exit_price_mtm"   : exit_price_mtm, # Harga close akhir window (untuk MTM P&L)
         "ambiguous_candle" : False,
     }
 
@@ -393,127 +409,88 @@ def simulate_trade_outcome(
 # =============================================================================
 
 def run_backtest(
-    df_m5        : pd.DataFrame,
-    df_h1        : pd.DataFrame,
-    warm_up      : int  = WARM_UP_CANDLES,
-    max_candles  : int  = MAX_FORWARD_CANDLES,
-    verbose      : bool = True,
+    df_m5               : pd.DataFrame,
+    df_h1               : pd.DataFrame,
+    warm_up             : int   = WARM_UP_CANDLES,
+    max_candles         : int   = MAX_FORWARD_CANDLES,
+    spread_pts          : float = DEFAULT_SPREAD_PTS,
+    profile             : str   = "scalp_m5",
+    rrr_min             : float | None = None,
+    atr_multiplier      : float | None = None,
+    swing_lookback      : int   | None = None,
+    swing_wing          : int   | None = None,
+    swing_clamp_min_atr : float | None = None,
+    swing_clamp_max_atr : float | None = None,
+    verbose             : bool  = True,
 ) -> tuple:
     """
     Jalankan backtest rule-based untuk seluruh DataFrame historis.
-
-    ALUR LENGKAP:
-        1. Hitung indikator M5 dan H1 masing-masing SATU KALI (O(n))
-        2. Merge H1 ke M5 via merge_asof backward (O(n log n))
-        3. Validasi zero look-ahead secara empiris (sampling acak)
-        4. Loop tiap candle i (dari warm_up ke end):
-             - Baca df_merged.iloc[i] — nilai indikator sudah causal
-             - Bangun signals dict identik dengan format live pipeline
-             - evaluate_entry(signals) — rule engine persis sama dengan live
-             - Jika BUY/SELL:
-                 a. find_nearest_swing(df.iloc[:i+1]) via calculate_sl_tp()
-                 b. simulate_trade_outcome() — forward-scan OHLC
-             - Skip candle yang masih dalam trade (satu posisi satu waktu)
-        5. compute_summary() — agregasi semua metrik
-
-    SATU POSISI PER WAKTU:
-        Selama ada trade yang masih "berjalan" (belum hit SL/TP/NO_HIT),
-        sinyal baru diabaikan. Ini mencerminkan kondisi trading nyata.
-        Untuk NO_HIT: posisi dianggap tidak ada (force-close di akhir window),
-        sehingga sinyal berikutnya tetap bisa dievaluasi.
-
-    Parameter:
-        df_m5       : DataFrame M5 MENTAH (belum ada kolom indikator)
-                      — harus punya DatetimeIndex ber-timezone
-                      — kolom: open, high, low, close, tick_volume
-        df_h1       : DataFrame H1 MENTAH (format sama dengan M5)
-        warm_up     : Candle awal yang dilewati (indikator belum fully converged)
-        max_candles : Batas forward scan per trade untuk SL/TP simulation
-        verbose     : Jika True, print progress tiap 500 candle
-
-    Return:
-        (trades_df, summary)
-        trades_df  : pd.DataFrame — satu baris per trade (skema lengkap di bawah)
-        summary    : dict — ringkasan agregat (win_rate, drawdown, dll)
-
-    SKEMA KOLOM trades_df:
-        entry_time        : Timestamp candle tempat sinyal muncul
-        exit_time         : Timestamp candle ketika SL/TP hit (None jika NO_HIT)
-        direction         : "BUY" / "SELL"
-        entry_price       : Harga entry dari calculate_sl_tp() (= close, entry_type=CLOSE)
-        sl                : Level Stop Loss
-        tp                : Level Take Profit
-        sl_method         : "SWING" / "ATR" — metode SL yang dipakai
-        atr_value         : Nilai ATR saat entry
-        outcome           : "TP_HIT" / "SL_HIT" / "NO_HIT"
-        candles_held      : Berapa candle trade terbuka
-        rrr_planned       : RRR yang direncanakan saat entry
-        rrr_realized      : RRR aktual berdasarkan outcome
-        jarak_sl          : Jarak SL dalam poin dollar
-        jarak_tp          : Jarak TP dalam poin dollar
-        pnl_points        : Profit/Loss dalam poin dollar
-        ambiguous_candle  : True jika SL dan TP kena candle yang sama
-        trend_m5          : Label trend M5 saat entry
-        trend_h1          : Label trend H1 saat entry
-        rsi_at_entry      : Nilai RSI saat entry
-        ema_gap_pct       : Jarak EMA 9 vs EMA 21 (%) saat entry
     """
-    print("=" * 60)
-    print("  BACKTEST ENGINE — XAUUSD M5 Rule-Based")
-    print("=" * 60)
-    print(f"  M5  candle : {len(df_m5):,} ({df_m5.index[0]} -> {df_m5.index[-1]})")
-    print(f"  H1  candle : {len(df_h1):,} ({df_h1.index[0]} -> {df_h1.index[-1]})")
-    print(f"  Warm-up    : {warm_up} candle (indikator warm-up window)")
-    print(f"  Max forward: {max_candles} candle per trade "
-          f"(~{max_candles * 5 / 60:.0f} jam trading time)")
-    print()
+    if verbose:
+        print("=" * 60)
+        print("  BACKTEST ENGINE — XAUUSD M5 Rule-Based")
+        print("=" * 60)
+        print(f"  M5  candle : {len(df_m5):,} ({df_m5.index[0]} -> {df_m5.index[-1]})")
+        print(f"  H1  candle : {len(df_h1):,} ({df_h1.index[0]} -> {df_h1.index[-1]})")
+        print(f"  Warm-up    : {warm_up} candle (indikator warm-up window)")
+        print(f"  Max forward: {max_candles} candle per trade "
+              f"(~{max_candles * 5 / 60:.0f} jam trading time)")
+        print(f"  Spread     : {spread_pts:.2f} USD per trade "
+              f"(cost total per round-trip: {spread_pts * 2:.2f} USD)")
+        print(f"  Profile    : {profile}")
+        print()
 
     # ─────────────────────────────────────────────────────────────────────────
     # LANGKAH 1: Hitung semua indikator SATU KALI untuk seluruh histori
     # ─────────────────────────────────────────────────────────────────────────
-    # EMA/RSI/ATR semuanya causal — nilai di baris i sama persis antara
-    # run(df_full) dan run(df[:i+1]). Dibuktikan oleh validate_no_lookahead().
-    print("[1/5] Menghitung indikator M5 (satu kali, O(n))...")
+    if verbose:
+        print("[1/5] Menghitung indikator M5 (satu kali, O(n))...")
     df_m5_ind = run_all_indicators(df_m5.copy())
 
-    print("[2/5] Menghitung indikator H1 (satu kali, O(n))...")
+    if verbose:
+        print("[2/5] Menghitung indikator H1 (satu kali, O(n))...")
     df_h1_ind = run_all_indicators(df_h1.copy())
 
     # ─────────────────────────────────────────────────────────────────────────
     # LANGKAH 2: Merge H1 ke M5 (anti-lookahead via direction="backward")
     # ─────────────────────────────────────────────────────────────────────────
-    print("[3/5] Merging H1 bias ke M5 (merge_asof backward)...")
+    if verbose:
+        print("[3/5] Merging H1 bias ke M5 (merge_asof backward)...")
     df_merged = merge_h1_to_m5(df_m5_ind, df_h1_ind)
 
     nan_h1_count = int(df_merged["trend_h1"].isna().sum())
-    if nan_h1_count > 0:
+    if nan_h1_count > 0 and verbose:
         print(f"   WARNING: {nan_h1_count} baris M5 tidak punya H1 reference "
               f"(sebelum H1 data dimulai) -- akan diskip di loop")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 3: Validasi zero look-ahead (bukti empiris, bukan sekadar klaim)
+    # LANGKAH 3: Validasi zero look-ahead
     # ─────────────────────────────────────────────────────────────────────────
-    print("[4/5] Validasi zero look-ahead (5 titik acak, toleransi 1e-6)...")
+    if verbose:
+        print("[4/5] Validasi zero look-ahead (5 titik acak, toleransi 1e-6)...")
     val = validate_no_lookahead(df_m5, n_samples=5)
-    print(f"   {val['message']}")
+    if verbose:
+        print(f"   {val['message']}")
 
     if not val["passed"]:
         raise RuntimeError(
             "validate_no_lookahead GAGAL -- ada look-ahead bias terdeteksi!\n"
             "Backtest dihentikan. Periksa detail di val['details']."
         )
-    print()
+    if verbose:
+        print()
 
     # ─────────────────────────────────────────────────────────────────────────
     # LANGKAH 4: Loop utama — evaluasi sinyal per candle
     # ─────────────────────────────────────────────────────────────────────────
-    print(f"[5/5] Scanning {len(df_merged) - warm_up:,} candle "
-          f"(index {warm_up} s/d {len(df_merged)-1})...")
+    if verbose:
+        print(f"[5/5] Scanning {len(df_merged) - warm_up:,} candle "
+              f"(index {warm_up} s/d {len(df_merged)-1})...")
 
     trades             = []
-    n_evaluated        = 0   # candle yang masuk evaluasi rule engine
-    n_signals          = 0   # sinyal BUY/SELL yang ditemukan
-    in_trade_until_idx = -1  # index terakhir trade yang masih "terbuka"
+    n_evaluated        = 0
+    n_signals          = 0
+    in_trade_until_idx = -1
 
     n_total = len(df_merged)
 
@@ -524,20 +501,14 @@ def run_backtest(
             print(f"   Progress: {i:,}/{n_total:,} ({pct:.0f}%) "
                   f"- {n_signals} sinyal, {len(trades)} trade valid")
 
-        # ── Skip jika masih dalam trade yang belum selesai ───────────────────
-        # Satu posisi satu waktu — mencerminkan kondisi trading nyata.
         if i <= in_trade_until_idx:
             continue
 
         row = df_merged.iloc[i]
 
-        # ── Skip jika H1 data belum tersedia (sebelum H1 histori dimulai) ────
         if pd.isna(row.get("trend_h1")):
             continue
 
-        # ── Bangun signals dict persis seperti format live pipeline ──────────
-        # Ini IDENTIK dengan struktur yang dipakai evaluate_entry() di app.py.
-        # Nilai-nilai ini causal — df_merged.iloc[i] hanya bergantung pada candle ≤ i.
         signals = {
             "time"        : df_merged.index[i],
             "close"       : float(row["close"]),
@@ -549,7 +520,6 @@ def run_backtest(
             "trend_h1"    : str(row["trend_h1"]),
         }
 
-        # ── Skip jika ada NaN di signals (edge candle setelah warm_up) ───────
         has_nan = any(
             isinstance(v, float) and np.isnan(v)
             for v in signals.values()
@@ -560,7 +530,6 @@ def run_backtest(
 
         n_evaluated += 1
 
-        # ── Evaluasi rule engine — IDENTIK dengan live pipeline ──────────────
         decision = evaluate_entry(signals)
 
         if decision["keputusan"] not in ("BUY", "SELL"):
@@ -569,17 +538,23 @@ def run_backtest(
         arah = decision["keputusan"]
         n_signals += 1
 
-        # ── Hitung SL/TP dengan data s/d candle i saja ───────────────────────
-        # df_m5_ind.iloc[:i+1] adalah potongan yang tidak mengandung candle masa depan.
-        # find_nearest_swing() yang ada di dalam calculate_sl_tp() menggunakan
-        # potongan ini — satu-satunya bagian yang per-sinyal, bukan divectorize.
         df_slice = df_m5_ind.iloc[: i + 1]
 
         risk = calculate_sl_tp(
-            df    = df_slice,
-            entry = signals["close"],
-            arah  = arah,
-            # tick_info=None di backtest (tidak ada live MT5) → entry_type="CLOSE"
+            df                  = df_slice,
+            entry               = signals["close"],
+            arah                = arah,
+            profile             = profile,
+            rrr_min             = rrr_min,
+            atr_multiplier      = atr_multiplier,
+            swing_lookback      = swing_lookback,
+            swing_wing          = swing_wing,
+            swing_clamp_min_atr = swing_clamp_min_atr,
+            swing_clamp_max_atr = swing_clamp_max_atr,
+            tick_info           = {
+                "ask": signals["close"] + spread_pts / 2,
+                "bid": signals["close"] - spread_pts / 2,
+            },
         )
 
         if not risk["valid"]:
@@ -590,14 +565,9 @@ def run_backtest(
         jarak_sl = risk["jarak_sl"]
         jarak_tp = risk["jarak_tp"]
 
-        # Guard: abaikan trade dengan jarak SL terlalu kecil (anomali data)
         if jarak_sl < MIN_SL_DISTANCE:
             continue
 
-        # ── Simulasi outcome (forward scan OHLC) ─────────────────────────────
-        # Gunakan df_m5_ind (DataFrame lengkap) untuk forward scan — kita SEDANG
-        # membaca candle masa depan di sini, tapi ini memang tujuannya: simulasi.
-        # Yang dilarang adalah memakai data masa depan saat MEMBUAT keputusan entry.
         outcome_info = simulate_trade_outcome(
             df_m5_full  = df_m5_ind,
             entry_idx   = i,
@@ -611,18 +581,33 @@ def run_backtest(
         candles_held = outcome_info["candles_held"]
         ambiguous    = outcome_info["ambiguous_candle"]
 
-        # ── Hitung P&L dan RRR realized ───────────────────────────────────────
-        if outcome == "TP_HIT":
-            rrr_realized = risk["rrr"]   # RRR planned = RRR realized saat TP
-            pnl_points   = +jarak_tp
-        elif outcome == "SL_HIT":
-            rrr_realized = -1.0          # loss 1R
-            pnl_points   = -jarak_sl
-        else:  # NO_HIT
-            rrr_realized = 0.0
-            pnl_points   = 0.0
+        spread_cost_total = spread_pts * 2
 
-        # ── Catat trade ke list hasil ─────────────────────────────────────────
+        if outcome == "TP_HIT":
+            rrr_realized = risk.get("rrr_after_spread") or risk["rrr"]
+            pnl_points   = +jarak_tp
+            pnl_net      = pnl_points - spread_cost_total
+            pnl_type     = "TP"
+
+        elif outcome == "SL_HIT":
+            rrr_realized = -1.0
+            pnl_points   = -jarak_sl
+            pnl_net      = pnl_points - spread_cost_total
+            pnl_type     = "SL"
+
+        else:  # NO_HIT
+            exit_price_mtm = outcome_info.get("exit_price_mtm", risk["entry"])
+
+            if arah == "BUY":
+                pnl_raw = exit_price_mtm - risk["entry"]
+            else:  # SELL
+                pnl_raw = risk["entry"] - exit_price_mtm
+
+            pnl_points   = max(pnl_raw, -jarak_sl)
+            pnl_net      = pnl_points - spread_cost_total
+            rrr_realized = round(pnl_points / jarak_sl, 4) if jarak_sl > 0 else 0.0
+            pnl_type     = "MTM"
+
         trades.append({
             "entry_time"       : str(df_merged.index[i]),
             "exit_time"        : outcome_info["exit_time"],
@@ -631,16 +616,21 @@ def run_backtest(
             "sl"               : sl,
             "tp"               : tp,
             "sl_method"        : risk["sl_method"],
+            "sl_swing_clamped" : risk.get("sl_swing_clamped", False),
+            "clamp_reason"     : risk.get("clamp_reason"),
             "atr_value"        : risk["atr_value"],
             "outcome"          : outcome,
             "candles_held"     : candles_held,
             "rrr_planned"      : risk["rrr"],
             "rrr_realized"     : rrr_realized,
+            "rrr_after_spread" : risk.get("rrr_after_spread"),
+            "spread_pts"       : spread_pts,
             "jarak_sl"         : jarak_sl,
             "jarak_tp"         : jarak_tp,
             "pnl_points"       : pnl_points,
+            "pnl_net"          : pnl_net,
+            "pnl_type"         : pnl_type,
             "ambiguous_candle" : ambiguous,
-            # Kolom konteks untuk audit mendalam
             "trend_m5"         : signals["trend"],
             "trend_h1"         : signals["trend_h1"],
             "rsi_at_entry"     : round(signals["rsi_14"], 2),
@@ -648,10 +638,11 @@ def run_backtest(
         })
 
         # ── Update pointer "sedang dalam trade" ──────────────────────────────
-        # Untuk TP_HIT dan SL_HIT: skip evaluasi sampai trade selesai.
-        # Untuk NO_HIT: tidak ada posisi terbuka formal → sinyal berikutnya boleh masuk.
-        if outcome in ("TP_HIT", "SL_HIT"):
-            in_trade_until_idx = i + candles_held
+        # FIX Item 3: Sekarang SEMUA outcome memblok slot selama candles_held candle.
+        # Bug lama: hanya TP_HIT/SL_HIT yang memblok → NO_HIT tidak memblok slot
+        # sehingga trade berikutnya bisa overlap dengan posisi NO_HIT yang "masih jalan".
+        # Setelah fix: NO_HIT juga dianggap menempati posisi selama window penuh.
+        in_trade_until_idx = i + candles_held
 
     # ─────────────────────────────────────────────────────────────────────────
     # LANGKAH 5: Susun output
@@ -681,14 +672,19 @@ def compute_summary(trades_df: pd.DataFrame) -> dict:
     METRIK YANG DILAPORKAN:
 
     Metrik utama:
-        total_trades     : Total trade seluruhnya (TP + SL + NO_HIT)
-        tp_count         : Jumlah trade yang hit TP
-        sl_count         : Jumlah trade yang hit SL
-        no_hit_count     : Jumlah trade yang tidak resolve dalam max_candles
-        closed_count     : tp_count + sl_count (trade yang benar-benar resolved)
-        win_rate         : tp_count / closed_count (hanya trade resolved)
-        no_hit_rate      : no_hit_count / total_trades — JANGAN DIABAIKAN
-        avg_rrr_realized : Rata-rata RRR realized dari trade resolved
+        total_trades         : Total trade seluruhnya (TP + SL + NO_HIT)
+        tp_count             : Jumlah trade yang hit TP
+        sl_count             : Jumlah trade yang hit SL
+        no_hit_count         : Jumlah trade yang tidak resolve dalam max_candles (MTM)
+        closed_count         : tp_count + sl_count (trade yang resolved via TP/SL)
+        win_rate             : tp_count / closed_count (hanya trade resolved via TP/SL)
+        no_hit_rate          : no_hit_count / total_trades — JANGAN DIABAIKAN
+        avg_rrr_realized     : Rata-rata RRR realized dari trade resolved (TP + SL only).
+                               Baseline: +0.20R.
+        avg_rrr_realized_all : Rata-rata RRR realized seluruh trade (TP + SL + MTM NO_HIT).
+        avg_candles_held     : Rata-rata candle held dari trade resolved (TP + SL only).
+                               Baseline: 80.8 candle.
+        avg_candles_held_all : Rata-rata candle held seluruh trade (termasuk MTM 288 candle).
 
     Metrik risiko:
         max_consec_loss  : Streak kalah berturut-turut terpanjang (SL_HIT only)
@@ -725,9 +721,10 @@ def compute_summary(trades_df: pd.DataFrame) -> dict:
     no_hit_rate = round(no_n  / total, 4) if total  > 0 else 0.0
     ambig_rate  = round(ambig / total, 4) if total  > 0 else 0.0
 
-    # Average RRR realized — hanya dari trade resolved (bukan NO_HIT)
+    # Average RRR realized — closed trade vs all trade
     closed_df  = trades_df[trades_df["outcome"].isin(["TP_HIT", "SL_HIT"])]
     avg_rrr    = round(float(closed_df["rrr_realized"].mean()), 4) if not closed_df.empty else None
+    avg_rrr_all= round(float(trades_df["rrr_realized"].mean()), 4) if "rrr_realized" in trades_df.columns else None
 
     # Max consecutive losses
     max_consec = _max_consecutive_losses(trades_df["outcome"].tolist())
@@ -738,37 +735,66 @@ def compute_summary(trades_df: pd.DataFrame) -> dict:
     drawdown    = equity - running_max
     max_dd      = round(float(drawdown.min()), 2) if not drawdown.empty else 0.0
 
-    # Average candles held (hanya closed trade)
+    # Average candles held — closed trade vs all trade
     avg_candles = (
         round(float(closed_df["candles_held"].mean()), 1)
         if not closed_df.empty else None
     )
+    avg_candles_all = (
+        round(float(trades_df["candles_held"].mean()), 1)
+        if "candles_held" in trades_df.columns else None
+    )
+
+    # Equity curve bersih (pakai pnl_net jika tersedia)
+    has_pnl_net = "pnl_net" in trades_df.columns
+    pnl_series   = trades_df["pnl_net"] if has_pnl_net else trades_df["pnl_points"]
+    equity_net   = pnl_series.cumsum()
+    running_max_net = equity_net.cummax()
+    drawdown_net    = equity_net - running_max_net
+    max_dd_net      = round(float(drawdown_net.min()), 2) if not drawdown_net.empty else 0.0
+
+    # Ambil spread_pts yang dipakai (dari kolom jika ada, default 0)
+    spread_used = float(trades_df["spread_pts"].iloc[0]) if "spread_pts" in trades_df.columns else 0.0
+
+    # Breakdown pnl_type (TP, SL, MTM)
+    pnl_type_breakdown = (
+        trades_df["pnl_type"].value_counts().to_dict()
+        if "pnl_type" in trades_df.columns else {}
+    )
 
     return {
         # ── Metrik utama ───────────────────────────────────────────────
-        "total_trades"       : total,
-        "tp_count"           : tp_n,
-        "sl_count"           : sl_n,
-        "no_hit_count"       : no_n,
-        "closed_count"       : closed,
-        "win_rate"           : win_rate,         # TP/(TP+SL) — tidak termasuk NO_HIT
-        "no_hit_rate"        : no_hit_rate,      # NO_HIT/total — selalu laporkan ini
-        "avg_rrr_realized"   : avg_rrr,
+        "total_trades"         : total,
+        "tp_count"             : tp_n,
+        "sl_count"             : sl_n,
+        "no_hit_count"         : no_n,
+        "closed_count"         : closed,
+        "win_rate"             : win_rate,            # TP/(TP+SL) — tidak termasuk NO_HIT
+        "no_hit_rate"          : no_hit_rate,         # NO_HIT/total — selalu laporkan ini
+        "avg_rrr_realized"     : avg_rrr,             # TP+SL only (baseline: +0.20R)
+        "avg_rrr_realized_all" : avg_rrr_all,         # Termasuk MTM NO_HIT
+        "avg_candles_held"     : avg_candles,         # TP+SL only (baseline: 80.8)
+        "avg_candles_held_all" : avg_candles_all,     # Termasuk MTM NO_HIT
 
-        # ── Metrik risiko ──────────────────────────────────────────────
-        "max_consec_loss"    : max_consec,
-        "max_drawdown_pts"   : max_dd,
-        "total_pnl_points"   : round(float(trades_df["pnl_points"].sum()), 2),
-        "avg_candles_held"   : avg_candles,
+        # ── Metrik risiko (kotor) ─────────────────────────────────────
+        "max_consec_loss"      : max_consec,
+        "max_drawdown_pts"     : max_dd,
+        "total_pnl_points"     : round(float(trades_df["pnl_points"].sum()), 2),
+
+        # ── Metrik bersih (setelah spread) ────────────────────────────
+        "spread_pts_used"      : spread_used,
+        "total_pnl_net"        : round(float(pnl_series.sum()), 2),
+        "max_drawdown_net"     : max_dd_net,
 
         # ── Metrik kualitas data ───────────────────────────────────────
-        "ambiguous_count"    : ambig,
-        "ambiguous_rate"     : ambig_rate,
+        "ambiguous_count"      : ambig,
+        "ambiguous_rate"       : ambig_rate,
 
         # ── Breakdown ─────────────────────────────────────────────────
-        "buy_count"          : int((trades_df["direction"] == "BUY").sum()),
-        "sell_count"         : int((trades_df["direction"] == "SELL").sum()),
-        "sl_method_breakdown": trades_df["sl_method"].value_counts().to_dict(),
+        "buy_count"            : int((trades_df["direction"] == "BUY").sum()),
+        "sell_count"           : int((trades_df["direction"] == "SELL").sum()),
+        "sl_method_breakdown"  : trades_df["sl_method"].value_counts().to_dict(),
+        "pnl_type_breakdown"   : pnl_type_breakdown,
     }
 
 
@@ -799,21 +825,28 @@ def _max_consecutive_losses(outcomes: list) -> int:
 def _empty_summary() -> dict:
     """Return ringkasan kosong jika tidak ada trade yang valid."""
     return {
-        "total_trades"       : 0,
-        "tp_count"           : 0,
-        "sl_count"           : 0,
-        "no_hit_count"       : 0,
-        "closed_count"       : 0,
-        "win_rate"           : None,
-        "no_hit_rate"        : None,
-        "avg_rrr_realized"   : None,
-        "max_consec_loss"    : 0,
-        "max_drawdown_pts"   : 0.0,
-        "total_pnl_points"   : 0.0,
-        "avg_candles_held"   : None,
-        "ambiguous_count"    : 0,
-        "ambiguous_rate"     : None,
-        "buy_count"          : 0,
-        "sell_count"         : 0,
-        "sl_method_breakdown": {},
+        "total_trades"         : 0,
+        "tp_count"             : 0,
+        "sl_count"             : 0,
+        "no_hit_count"         : 0,
+        "closed_count"         : 0,
+        "win_rate"             : None,
+        "no_hit_rate"          : None,
+        "avg_rrr_realized"     : None,
+        "avg_rrr_realized_all" : None,
+        "avg_candles_held"     : None,
+        "avg_candles_held_all" : None,
+        "max_consec_loss"      : 0,
+        "max_drawdown_pts"     : 0.0,
+        "total_pnl_points"     : 0.0,
+        "spread_pts_used"      : 0.0,
+        "total_pnl_net"        : 0.0,
+        "max_drawdown_net"     : 0.0,
+        "ambiguous_count"      : 0,
+        "ambiguous_rate"       : None,
+        "buy_count"            : 0,
+        "sell_count"           : 0,
+        "sl_method_breakdown"  : {},
+        "pnl_type_breakdown"   : {},
     }
+

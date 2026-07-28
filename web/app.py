@@ -204,6 +204,7 @@ def analyze():
             df        = df_m5,
             entry     = signals["close"],
             arah      = risk_direction,
+            profile   = "scalp_m5",
             tick_info = tick_info,
         )
         if risk and isinstance(risk, dict):
