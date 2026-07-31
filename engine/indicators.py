@@ -311,6 +311,65 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
 
 # =============================================================================
+# BAGIAN 4b: VOLUME RATIO — Aktivitas Pasar Relatif
+# =============================================================================
+
+VOLUME_RATIO_WINDOW = 50  # Candle untuk rolling mean sebagai baseline
+
+
+def calculate_volume_ratio(
+    df     : pd.DataFrame,
+    window : int = VOLUME_RATIO_WINDOW,
+) -> pd.DataFrame:
+    """
+    Hitung volume_ratio = tick_volume saat ini / rolling_mean(tick_volume, window).
+
+    APA ITU VOLUME_RATIO:
+        volume_ratio mengukur seberapa aktif candle saat ini dibanding rata-rata
+        N candle sebelumnya. Nilai 1.0 = volume normal. Nilai 1.5 = 50% di atas
+        rata-rata. Nilai 0.5 = hanya setengah rata-rata (pasar tipis).
+
+        Berbeda dari tick_volume mentah, volume_ratio bersifat RELATIF — sehingga
+        threshold yang sama berlaku di berbagai sesi dan kondisi pasar.
+
+    KENAPA CAUSAL (ZERO LOOK-AHEAD):
+        pandas .rolling(window, min_periods=1).mean() dengan default center=False
+        (backward-looking) hanya memakai data dari baris [i-window+1 ... i].
+        Nilai di baris i TIDAK bergantung pada baris i+1, i+2, dst.
+        Ini identik dengan jaminan causal dari .ewm() yang dipakai di EMA.
+
+    CATATAN WARM-UP:
+        Baris pertama (volume_ratio[0]) = 1.0 karena min_periods=1 membagi
+        volume[0] dengan rolling_mean yang berisi 1 elemen = volume[0] itu sendiri.
+        Warm-up window pertama (< `window` candle) masih valid — hanya rolling
+        mean-nya dibangun dari lebih sedikit candle.
+
+    Parameter:
+        df     : DataFrame dari get_candles() — harus punya kolom 'tick_volume'
+        window : Panjang rolling window untuk baseline mean. Default: 50.
+                 Nilai ini dipilih berdasarkan karakteristik data M5 XAUUSD:
+                 50 candle M5 ≈ 4.2 jam trading time (tidak terlalu pendek agar
+                 tidak terlalu reaktif, tidak terlalu panjang agar tetap adaptif).
+
+    Return:
+        DataFrame yang sama + kolom baru 'volume_ratio'
+    """
+    _check_dataframe(df, required_columns=["tick_volume"])
+
+    # Rolling mean backward-looking (causal) — min_periods=1 hindari NaN di awal
+    rolling_mean = df["tick_volume"].rolling(window=window, min_periods=1).mean()
+
+    # Hindari pembagian dengan nol (sangat jarang, tapi defensif)
+    df["volume_ratio"] = np.where(
+        rolling_mean > 0,
+        df["tick_volume"] / rolling_mean,
+        1.0,  # fallback: anggap normal jika rolling_mean nol
+    )
+
+    return df
+
+
+# =============================================================================
 # BAGIAN 5: FUNGSI UTAMA — Jalankan Semua Indikator Sekaligus
 # =============================================================================
 
@@ -319,22 +378,24 @@ def run_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     Shortcut untuk menjalankan semua kalkulasi indikator dalam satu panggilan.
 
     Fungsi ini memanggil calculate_ema → calculate_rsi → detect_trend → calculate_atr
-    secara berurutan. Urutan penting karena detect_trend butuh hasil EMA.
+    → calculate_volume_ratio secara berurutan.
 
     ASUMSI INPUT:
         df yang diterima sudah berisi candle CLOSED semua (jaminan dari get_candles()).
         Tidak perlu buang baris terakhir di sini karena data sudah bersih.
 
     Parameter:
-        df : DataFrame mentah dari get_candles() — semua baris sudah closed
+        df : DataFrame mentah dari get_candles() — semua baris sudah closed.
+             Harus punya kolom: open, high, low, close, tick_volume
 
     Return:
         DataFrame lengkap dengan semua kolom indikator:
-        - ema_9, ema_21  (dari calculate_ema)
-        - rsi_14         (dari calculate_rsi)
-        - trend          (dari detect_trend): "UPTREND" / "DOWNTREND" / "SIDEWAYS"
-        - ema_gap_pct    (dari detect_trend): kekuatan trend dalam persen
-        - atr_14         (dari calculate_atr): volatilitas rata-rata per candle
+        - ema_9, ema_21   (dari calculate_ema)
+        - rsi_14          (dari calculate_rsi)
+        - trend           (dari detect_trend): "UPTREND" / "DOWNTREND" / "SIDEWAYS"
+        - ema_gap_pct     (dari detect_trend): kekuatan trend dalam persen
+        - atr_14          (dari calculate_atr): volatilitas rata-rata per candle
+        - volume_ratio    (dari calculate_volume_ratio): aktivitas pasar relatif
 
     Contoh penggunaan:
         from engine.data_fetcher import initialize_mt5, get_candles, shutdown_mt5
@@ -350,6 +411,7 @@ def run_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_rsi(df, period=14)
     df = detect_trend(df)
     df = calculate_atr(df, period=14)
+    df = calculate_volume_ratio(df)  # kondisi ketiga Fase 3.2 — dari sumber independen
     return df
 
 
@@ -408,6 +470,9 @@ def get_latest_signals(df: pd.DataFrame) -> dict:
 
     if "atr_14" in df.columns and not pd.isna(last["atr_14"]):
         res["atr_14"] = round(float(last["atr_14"]), 2)
+
+    if "volume_ratio" in df.columns and not pd.isna(last["volume_ratio"]):
+        res["volume_ratio"] = round(float(last["volume_ratio"]), 4)
 
     try:
         from engine.risk_manager import find_nearest_swing

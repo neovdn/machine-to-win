@@ -158,6 +158,7 @@ def run_one_fold_validation(
     val_end    : str,
     params     : dict,
     fold_label : str = "",
+    volume_mode: str = "FILTER",
 ) -> dict:
     """
     Jalankan backtest parameter fixed di window validasi satu fold.
@@ -202,6 +203,7 @@ def run_one_fold_validation(
         lookback    = params["lookback"],
         wing        = params["wing"],
         rrr_min     = params["rrr_min"],
+        volume_mode = volume_mode,
         spread_pts  = DEFAULT_SPREAD_PTS,
         max_candles = MAX_FORWARD_CANDLES,
         warm_up     = WARM_UP_CANDLES,

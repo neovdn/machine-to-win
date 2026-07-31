@@ -91,6 +91,44 @@ RSI_STRONG_TREND_EMA_GAP_THRESHOLD = 0.15  # dalam persen (abs value)
 # Keduanya harus searah sebelum engine boleh output BUY atau SELL.
 MINIMUM_CONDITIONS_MET = 2
 
+# =============================================================================
+# KONFIGURASI KONDISI KETIGA: VOLUME PARTICIPATION (Fase 3.2)
+# =============================================================================
+#
+# volume_ratio = tick_volume_candle / rolling50_mean(tick_volume)
+# Sumber: kolom 'volume_ratio' dari indicators.calculate_volume_ratio().
+#
+# FILOSOFI (berbeda dari EMA/RSI):
+#   Volume tidak mengandung informasi ARAH (long atau short). Volume hanya
+#   mengandung informasi KUALITAS PARTISIPASI pasar.
+#   Oleh karena itu dikimplementasi sebagai FILTER/VETO, bukan kondisi entry
+#   beridentitas BUY/SELL. Entry hanya diizinkan saat volume_ratio berada
+#   di zona medium (bukan ekstrem rendah maupun tinggi):
+#   - Terlalu rendah (< LOW_THRESHOLD) = pasar tipis, noise lebih mendominasi.
+#   - Terlalu tinggi (> HIGH_THRESHOLD) = potensi climax/exhaustion, bukan kelanjutan.
+#   - Zona medium = partisipasi normal, sinyal lebih dapat dipercaya.
+#
+# THRESHOLD:
+#   Nilai berikut diturunkan dari distribusi 14 bulan data (80,958 candle M5):
+#     Q25 volume_ratio ≈ 0.71, Q75 ≈ 1.28
+#   Threshold dipilih SEDIKIT LEBIH LEBAR dari Q25/Q75 (0.50 dan 1.80) untuk
+#   menghindari over-filtering — hanya menolak candle yang benar-benar ekstrem.
+#   Sesuai prinsip Fase 3: jangan jadikan bucket kecil (<30 trade) sebagai
+#   dasar kalibrasi, gunakan threshold yang robust secara distribusi.
+#
+# VOLUME_MODE mengontrol cara volume diintegrasikan di evaluate_entry():
+#   "FILTER"     : veto saja (tidak menambah konfirmasi), MINIMUM_CONDITIONS_MET=2
+#   "CONDITION"  : kondisi ke-3 penuh, bisa menaikkan konfirmasi_terpenuhi ke 3
+#
+# Untuk walk-forward Fase 3.2: dua varian diuji lewat scripts/run_walk_forward_phase3.py
+# yang memanggil evaluate_entry() dengan mode yang berbeda via override.
+VOLUME_RATIO_LOW_THRESHOLD  = 0.708  # Batas bawah: Q25 dari distribusi (sebelum walk-forward)
+VOLUME_RATIO_HIGH_THRESHOLD = 1.278  # Batas atas : Q75 dari distribusi (sebelum walk-forward)
+
+# Mode integrasi volume di evaluate_entry() — bisa di-override dari luar.
+# JANGAN ubah nilai default ini untuk produksi — gunakan parameter saat call.
+VOLUME_MODE_DEFAULT = "FILTER"  # "FILTER" atau "CONDITION"
+
 
 # =============================================================================
 # KONDISI 1: BIAS ARAH DARI H1
@@ -369,10 +407,113 @@ def _check_rsi_filter(signals: dict, arah_kandidat: str) -> dict:
 
 
 # =============================================================================
+# KONDISI 3 / FILTER 2: VOLUME PARTICIPATION (Fase 3.2)
+# =============================================================================
+# Sumber: signals["volume_ratio"] dari indicators.calculate_volume_ratio().
+#
+# Peran: menilai KUALITAS PARTISIPASI pasar pada candle entry.
+# Volume tidak korelasi dengan arah (EMA), sehingga memberikan informasi
+# independen: apakah ada partisipasi pasar yang cukup untuk mendukung
+# pergerakan yang signifikan?
+#
+# Logika: tolak entry di candle dengan volume ekstrem (terlalu tipis atau
+# terlalu jenuh) — zona medium menunjukkan kondisi pasar paling kondusif.
+
+def _check_volume_participation(signals: dict) -> dict:
+    """
+    Evaluasi apakah volume candle saat ini berada di zona partisipasi yang sehat.
+
+    LOGIKA:
+        volume_ratio < VOLUME_RATIO_LOW_THRESHOLD  (α=0.50):
+            Volume terlalu rendah — pasar tipis, sinyal berisiko noise.
+            memblokir = True  (tolak entry)
+
+        volume_ratio > VOLUME_RATIO_HIGH_THRESHOLD (β=1.80):
+            Volume terlalu tinggi — potensi exhaustion/climax.
+            memblokir = True  (tolak entry)
+
+        VOLUME_RATIO_LOW_THRESHOLD ≤ volume_ratio ≤ VOLUME_RATIO_HIGH_THRESHOLD:
+            Zona medium — partisipasi normal, kondisi kondusif.
+            memblokir = False
+
+    CATATAN GRACEFUL DEGRADATION:
+        Jika 'volume_ratio' tidak ada di signals (misalnya data lama yang tidak
+        punya tick_volume, atau mode live tanpa kolom ini), fungsi ini NOT BLOCK
+        dan mencatat keterangan bahwa data tidak tersedia. Ini mencegah crash
+        bila rule engine dipanggil dari konteks tanpa data volume.
+
+    Dalam mode CONDITION (kondisi ke-3 penuh):
+        - terpenuhi = True  jika volume di zona medium
+        - arah = arah kandidat (diteruskan dari konteks luar, karena volume
+          tidak punya informasi arah sendiri)
+        - Caller (evaluate_entry) yang mengontrol apakah ini masuk hitungan
+          kondisi_terpenuhi atau veto saja.
+
+    Return dict:
+        {
+            "memblokir"   : bool   — True jika volume ekstrem (veto entry)
+            "terpenuhi"   : bool   — True jika volume di zona medium
+            "zona"        : str    — "RENDAH", "NORMAL", "TINGGI"
+            "volume_ratio": float  — nilai volume_ratio terbaru
+            "keterangan"  : str    — penjelasan ringkas
+            "data_tersedia": bool  — False jika signals tidak punya 'volume_ratio'
+        }
+    """
+    # Graceful degradation jika volume_ratio tidak tersedia
+    if "volume_ratio" not in signals or signals["volume_ratio"] is None:
+        return {
+            "memblokir"    : False,   # tidak blokir — jangan crash tanpa data
+            "terpenuhi"    : False,   # tidak dihitung sebagai konfirmasi
+            "arah"         : "NETRAL",
+            "zona"         : "UNKNOWN",
+            "volume_ratio" : None,
+            "keterangan"   : "Volume_ratio tidak tersedia — filter dinonaktifkan",
+            "data_tersedia": False,
+        }
+
+    vr = float(signals["volume_ratio"])
+
+    if vr < VOLUME_RATIO_LOW_THRESHOLD:
+        zona      = "RENDAH"
+        terpenuhi = False
+        memblokir = True
+        keterangan = (
+            f"Volume ratio {vr:.3f} < {VOLUME_RATIO_LOW_THRESHOLD} (RENDAH) — "
+            f"pasar terlalu tipis, sinyal berisiko noise"
+        )
+    elif vr > VOLUME_RATIO_HIGH_THRESHOLD:
+        zona      = "TINGGI"
+        terpenuhi = False
+        memblokir = True
+        keterangan = (
+            f"Volume ratio {vr:.3f} > {VOLUME_RATIO_HIGH_THRESHOLD} (TINGGI) — "
+            f"potensi volume climax / exhaustion, hindari entry"
+        )
+    else:
+        zona      = "NORMAL"
+        terpenuhi = True
+        memblokir = False
+        keterangan = (
+            f"Volume ratio {vr:.3f} [{VOLUME_RATIO_LOW_THRESHOLD}–{VOLUME_RATIO_HIGH_THRESHOLD}] "
+            f"(NORMAL) — partisipasi pasar kondusif untuk entry"
+        )
+
+    return {
+        "memblokir"    : memblokir,
+        "terpenuhi"    : terpenuhi,
+        "arah"         : "NETRAL",  # volume tidak berisi informasi arah
+        "zona"         : zona,
+        "volume_ratio" : round(vr, 4),
+        "keterangan"   : keterangan,
+        "data_tersedia": True,
+    }
+
+
+# =============================================================================
 # FUNGSI UTAMA: EVALUATE ENTRY
 # =============================================================================
 
-def evaluate_entry(signals: dict) -> dict:
+def evaluate_entry(signals: dict, volume_mode: str = VOLUME_MODE_DEFAULT) -> dict:
     """
     Fungsi utama rule engine — evaluasi semua kondisi dan beri keputusan akhir.
 
@@ -388,6 +529,7 @@ def evaluate_entry(signals: dict) -> dict:
         signals : dict dari get_latest_signals() — minimal harus punya:
                   "trend", "trend_h1", "ema_9", "ema_21", "ema_gap_pct",
                   "rsi_14", "close", "time"
+        volume_mode: str — "FILTER" atau "CONDITION". Default dari VOLUME_MODE_DEFAULT.
 
     Return:
         dict berisi:
@@ -416,6 +558,7 @@ def evaluate_entry(signals: dict) -> dict:
 
     c_h1  = _check_bias_h1(signals)
     c_m5  = _check_ema_trigger_m5(signals)
+    c_vol = _check_volume_participation(signals)
 
     # Kumpulkan semua hasil kondisi entry ke dalam list
     # Format: (nama_kondisi, hasil_dict)
@@ -430,6 +573,11 @@ def evaluate_entry(signals: dict) -> dict:
         # ("candle_pattern", _check_candle(signals)),   # ← atau ini
     ]
 
+    min_conditions = MINIMUM_CONDITIONS_MET
+    if volume_mode == "CONDITION":
+        kondisi_entry.append(("volume", c_vol))
+        min_conditions = 3  # Naikkan minimum konfirmasi
+
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 2: Hitung berapa kondisi terpenuhi dan tentukan arah kandidat
     # ─────────────────────────────────────────────────────────────────────────
@@ -438,8 +586,8 @@ def evaluate_entry(signals: dict) -> dict:
     kondisi_terpenuhi = sum(1 for _, hasil in kondisi_entry if hasil["terpenuhi"])
 
     # Tentukan arah mayoritas dari kondisi yang terpenuhi
-    # (jika semua kondisi konsisten, ini mudah — kalau nanti ada konflik, perlu voting)
-    arah_votes = [hasil["arah"] for _, hasil in kondisi_entry if hasil["terpenuhi"]]
+    # Abaikan hasil["arah"] == "NETRAL" (seperti dari filter volume)
+    arah_votes = [hasil["arah"] for _, hasil in kondisi_entry if hasil["terpenuhi"] and hasil["arah"] != "NETRAL"]
 
     if len(set(arah_votes)) == 1 and arah_votes:
         # Semua kondisi yang terpenuhi menunjuk arah yang sama
@@ -451,18 +599,25 @@ def evaluate_entry(signals: dict) -> dict:
         arah_kandidat = "NETRAL"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # TAHAP 3: Evaluasi filter RSI terhadap arah kandidat
+    # TAHAP 3: Evaluasi filter RSI dan Volume terhadap arah kandidat
     # ─────────────────────────────────────────────────────────────────────────
 
     c_rsi = _check_rsi_filter(signals, arah_kandidat)
+
+    vol_memblokir = False
+    if volume_mode == "FILTER":
+        vol_memblokir = c_vol["memblokir"]
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 4: Tentukan keputusan final
     # ─────────────────────────────────────────────────────────────────────────
 
-    cukup_kondisi = kondisi_terpenuhi >= MINIMUM_CONDITIONS_MET
+    cukup_kondisi = kondisi_terpenuhi >= min_conditions
 
-    if cukup_kondisi and arah_kandidat != "NETRAL" and not c_rsi["memblokir"]:
+    # Apakah ada filter yang memblokir?
+    filter_memblokir = c_rsi["memblokir"] or vol_memblokir
+
+    if cukup_kondisi and arah_kandidat != "NETRAL" and not filter_memblokir:
         # ✅ ENTRY — semua syarat terpenuhi
         keputusan = arah_kandidat                      # "BUY" atau "SELL"
         arah_label = "LONG" if arah_kandidat == "BUY" else "SHORT"
@@ -472,16 +627,21 @@ def evaluate_entry(signals: dict) -> dict:
             if hasil["terpenuhi"]:
                 alasan_entry.append(hasil["keterangan"])
         alasan_entry.append(c_rsi["keterangan"])
+        if volume_mode == "FILTER":
+            alasan_entry.append(f"[Volume OK] {c_vol['keterangan']}")
 
-    elif cukup_kondisi and arah_kandidat != "NETRAL" and c_rsi["memblokir"]:
-        # ⏳ WAIT — kondisi entry terpenuhi tapi RSI memblokir
+    elif cukup_kondisi and arah_kandidat != "NETRAL" and filter_memblokir:
+        # ⏳ WAIT — kondisi entry terpenuhi tapi filter memblokir
         keputusan  = "WAIT"
         arah_label = None
 
         for _, hasil in kondisi_entry:
             if hasil["terpenuhi"]:
                 alasan_wait.append(f"[Kondisi OK] {hasil['keterangan']}")
-        alasan_wait.append(f"[RSI BLOKIR] {c_rsi['keterangan']}")
+        if c_rsi["memblokir"]:
+            alasan_wait.append(f"[RSI BLOKIR] {c_rsi['keterangan']}")
+        if vol_memblokir:
+            alasan_wait.append(f"[VOL BLOKIR] {c_vol['keterangan']}")
 
     else:
         # ⏳ WAIT — kondisi entry tidak cukup terpenuhi
@@ -493,7 +653,18 @@ def evaluate_entry(signals: dict) -> dict:
                 alasan_wait.append(hasil["keterangan"])
             else:
                 alasan_entry.append(f"[Terpenuhi] {hasil['keterangan']}")
-        alasan_wait.append(c_rsi["keterangan"])
+        
+        # Tambahkan alasan dari filter jika arah_kandidat ada tapi tidak cukup kondisi
+        if c_rsi["memblokir"]:
+            alasan_wait.append(c_rsi["keterangan"])
+        elif arah_kandidat != "NETRAL":
+            alasan_entry.append(c_rsi["keterangan"])
+            
+        if volume_mode == "FILTER":
+            if vol_memblokir:
+                alasan_wait.append(c_vol["keterangan"])
+            elif arah_kandidat != "NETRAL":
+                alasan_entry.append(c_vol["keterangan"])
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 5: Kumpulkan context warnings dari session_filter
@@ -529,6 +700,11 @@ def evaluate_entry(signals: dict) -> dict:
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 6: Susun output lengkap
     # ─────────────────────────────────────────────────────────────────────────
+    
+    kondisi_detail = {nama: hasil for nama, hasil in kondisi_entry}
+    kondisi_detail["rsi_filter"] = c_rsi
+    if volume_mode == "FILTER":
+        kondisi_detail["volume_filter"] = c_vol
 
     return {
         # Keputusan akhir
@@ -546,15 +722,11 @@ def evaluate_entry(signals: dict) -> dict:
         "alasan_wait"  : alasan_wait,
 
         # Breakdown detail tiap kondisi — untuk audit mendalam
-        "kondisi_detail" : {
-            "bias_h1"        : c_h1,
-            "ema_trigger_m5" : c_m5,
-            "rsi_filter"     : c_rsi,
-        },
+        "kondisi_detail" : kondisi_detail,
 
         # Statistik konfirmasi
         "konfirmasi_terpenuhi"  : kondisi_terpenuhi,
-        "konfirmasi_dibutuhkan" : MINIMUM_CONDITIONS_MET,
+        "konfirmasi_dibutuhkan" : min_conditions,
 
         # Context market saat evaluasi
         "close"           : signals["close"],

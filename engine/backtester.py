@@ -421,6 +421,7 @@ def run_backtest(
     swing_wing          : int   | None = None,
     swing_clamp_min_atr : float | None = None,
     swing_clamp_max_atr : float | None = None,
+    volume_mode         : str   = "FILTER",
     verbose             : bool  = True,
 ) -> tuple:
     """
@@ -518,6 +519,7 @@ def run_backtest(
             "trend"       : str(row["trend"]),
             "ema_gap_pct" : float(row["ema_gap_pct"]),
             "trend_h1"    : str(row["trend_h1"]),
+            "volume_ratio": float(row["volume_ratio"]) if "volume_ratio" in row and not pd.isna(row.get("volume_ratio")) else None,
         }
 
         has_nan = any(
@@ -530,7 +532,7 @@ def run_backtest(
 
         n_evaluated += 1
 
-        decision = evaluate_entry(signals)
+        decision = evaluate_entry(signals, volume_mode=volume_mode)
 
         if decision["keputusan"] not in ("BUY", "SELL"):
             continue

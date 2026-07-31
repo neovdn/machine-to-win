@@ -45,6 +45,7 @@ def run_fast_backtest(
     spread_pts: float = DEFAULT_SPREAD_PTS,
     max_candles: int = MAX_FORWARD_CANDLES,
     warm_up: int = WARM_UP_CANDLES,
+    volume_mode: str = "FILTER",
 ) -> tuple:
     """
     Eksekusi backtest super cepat tanpa menghitung ulang indikator.
@@ -70,6 +71,7 @@ def run_fast_backtest(
             "trend"       : str(row["trend"]),
             "ema_gap_pct" : float(row["ema_gap_pct"]),
             "trend_h1"    : str(row["trend_h1"]),
+            "volume_ratio": float(row["volume_ratio"]) if "volume_ratio" in row and not pd.isna(row.get("volume_ratio")) else None,
         }
 
         has_nan = any(
@@ -80,7 +82,7 @@ def run_fast_backtest(
         if has_nan:
             continue
 
-        decision = evaluate_entry(signals)
+        decision = evaluate_entry(signals, volume_mode=volume_mode)
         if decision["keputusan"] not in ("BUY", "SELL"):
             continue
 

@@ -116,6 +116,7 @@ class TestNoLookaheadBias(unittest.TestCase):
         self.assertAlmostEqual(float(val_t_orig["ema_9"]), float(val_t_mutated["ema_9"]), places=5)
         self.assertAlmostEqual(float(val_t_orig["ema_21"]), float(val_t_mutated["ema_21"]), places=5)
         self.assertAlmostEqual(float(val_t_orig["rsi_14"]), float(val_t_mutated["rsi_14"]), places=5)
+        self.assertAlmostEqual(float(val_t_orig["volume_ratio"]), float(val_t_mutated["volume_ratio"]), places=5)
 
 
         # Evaluasi ulang keputusan pada candle t
