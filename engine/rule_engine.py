@@ -125,9 +125,13 @@ MINIMUM_CONDITIONS_MET = 2
 VOLUME_RATIO_LOW_THRESHOLD  = 0.708  # Batas bawah: Q25 dari distribusi (sebelum walk-forward)
 VOLUME_RATIO_HIGH_THRESHOLD = 1.278  # Batas atas : Q75 dari distribusi (sebelum walk-forward)
 
-# Mode integrasi volume di evaluate_entry() — bisa di-override dari luar.
-# JANGAN ubah nilai default ini untuk produksi — gunakan parameter saat call.
-VOLUME_MODE_DEFAULT = "FILTER"  # "FILTER" atau "CONDITION"
+# Mode integrasi volume di evaluate_entry() -- bisa di-override dari luar.
+# JANGAN ubah nilai default ini untuk produksi -- gunakan parameter saat call.
+# Mode yang tersedia:
+#   "FILTER"    : volume sebagai veto saja (tidak menambah konfirmasi)
+#   "CONDITION" : volume sebagai kondisi ke-3 penuh
+#   "IGNORE"    : volume tidak dipakai sama sekali (untuk analisis/backtest murni)
+VOLUME_MODE_DEFAULT = "FILTER"  # "FILTER", "CONDITION", atau "IGNORE"
 
 
 # =============================================================================
@@ -607,6 +611,8 @@ def evaluate_entry(signals: dict, volume_mode: str = VOLUME_MODE_DEFAULT) -> dic
     vol_memblokir = False
     if volume_mode == "FILTER":
         vol_memblokir = c_vol["memblokir"]
+    # mode "IGNORE": volume tidak dipakai sama sekali (vol_memblokir tetap False)
+    # mode "CONDITION": volume sudah masuk kondisi_entry, bukan di sini
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 4: Tentukan keputusan final
@@ -739,77 +745,81 @@ def evaluate_entry(signals: dict, volume_mode: str = VOLUME_MODE_DEFAULT) -> dic
 
 
 # =============================================================================
-# HELPER INTERNAL — Setup Quality Scoring (Auditable 0-8 Poin)
+# HELPER INTERNAL — Setup Quality Scoring (Auditable 0-6 Poin)
 # =============================================================================
+# Fase 4.3 (2026-08-03): alignment dihapus (tautologi struktural),
+# swing_distance diperbaiki (data kini di-feed dari pipeline sebelum evaluate_entry).
+# Skor maks: 8 -> 6. Threshold: STRONG >=5, MODERATE >=3, WEAK <3.
 
 def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) -> dict:
     """
-    Hitung setup_quality ("STRONG", "MODERATE", "WEAK") berbasis point-based scoring (0-8 Poin).
+    Hitung setup_quality ("STRONG", "MODERATE", "WEAK") berbasis point-based scoring (0-6 Poin).
 
-    4 Komponen Scoring:
-        1. EMA Gap Strength (0-2 pts): Kekuatan trend M5 dari gap EMA
-        2. Alignment H1 & M5 (0-2 pts): Keselarasan bias makro H1 dan trigger M5
-        3. RSI Zone (0-2 pts): RSI netral optimum vs ekstrem
-        4. Swing Distance (0-2 pts): Jarak harga ke struktur swing terdekat vs ATR
+    3 Komponen Scoring (setelah Fase 4.3):
+        1. EMA Gap Strength  (0-2 pts): Kekuatan trend M5 dari gap EMA
+        2. RSI Zone          (0-2 pts): RSI di zona netral vs ekstrem
+        3. Swing Distance    (0-2 pts): Jarak harga ke swing terdekat vs ATR
+                                        (data via signals["swing_low"]/["swing_high"]
+                                        yang di-feed pipeline sebelum evaluate_entry)
+
+    CATATAN ARSITEKTUR (Fase 4.3):
+        Komponen alignment H1-M5 dihapus -- terbukti tautologi secara struktural:
+        evaluate_entry() mensyaratkan H1 dan M5 searah (MINIMUM_CONDITIONS_MET=2)
+        sebelum trade bisa terjadi, sehingga alignment SELALU 2 untuk setiap trade.
+        Zero variance, tidak bisa membedakan setup apapun. Bukan bug data, tapi
+        konsekuensi matematis dari arsitektur filter entry.
+
+    Threshold (proporsional dari skema 0-8 lama, max 6):
+        STRONG   >= 5  (dari >=6/8=75% -> 75%*6=4.5 -> dibulatkan ke 5)
+        MODERATE >= 3  (dari >=4/8=50% -> 50%*6=3.0)
+        WEAK      < 3
     """
-    breakdown = {}
+    breakdown   = {}
     total_score = 0
 
     # 1. EMA Gap Strength (0-2)
     ema_gap_pct = abs(signals.get("ema_gap_pct", 0.0))
     if ema_gap_pct >= 0.15:
-        score_gap = 2
+        score_gap  = 2
         detail_gap = f"Gap EMA {ema_gap_pct:+.4f}% (Trend Kuat >= 0.15%)"
     elif ema_gap_pct >= 0.08:
-        score_gap = 1
+        score_gap  = 1
         detail_gap = f"Gap EMA {ema_gap_pct:+.4f}% (Trend Sedang 0.08-0.15%)"
     else:
-        score_gap = 0
+        score_gap  = 0
         detail_gap = f"Gap EMA {ema_gap_pct:+.4f}% (Trend Tipis < 0.08%)"
     total_score += score_gap
     breakdown["ema_gap"] = {
-        "score": score_gap, "max": 2, "label": "Kekuatan Trend M5 (EMA Gap)", "detail": detail_gap
+        "score": score_gap, "max": 2,
+        "label": "Kekuatan Trend M5 (EMA Gap)", "detail": detail_gap,
     }
 
-    # 2. Timeframe Alignment (0-2)
-    trend_h1 = signals.get("trend_h1", "SIDEWAYS")
-    trend_m5 = signals.get("trend", "SIDEWAYS")
-    if trend_h1 == trend_m5 and trend_h1 in ("UPTREND", "DOWNTREND"):
-        score_align = 2
-        detail_align = f"Searah — H1 {trend_h1} & M5 {trend_m5}"
-    elif (trend_h1 in ("UPTREND", "DOWNTREND") and trend_m5 == "SIDEWAYS") or \
-         (trend_m5 in ("UPTREND", "DOWNTREND") and trend_h1 == "SIDEWAYS"):
-        score_align = 1
-        detail_align = f"Parsial — H1 {trend_h1} vs M5 {trend_m5}"
-    else:
-        score_align = 0
-        detail_align = f"Konflik / Netral — H1 {trend_h1} vs M5 {trend_m5}"
-    total_score += score_align
-    breakdown["alignment"] = {
-        "score": score_align, "max": 2, "label": "Keselarasan Timeframe H1 & M5", "detail": detail_align
-    }
-
-    # 3. RSI Zone (0-2)
+    # 2. RSI Zone (0-2)
     rsi = signals.get("rsi_14", 50.0)
     if 40.0 <= rsi <= 60.0:
-        score_rsi = 2
+        score_rsi  = 2
         detail_rsi = f"RSI {rsi:.1f} (Zona Optimum Netral 40-60)"
     elif (30.0 <= rsi < 40.0) or (60.0 < rsi <= 70.0):
-        score_rsi = 1
+        score_rsi  = 1
         detail_rsi = f"RSI {rsi:.1f} (Zona Waspada 30-40 / 60-70)"
     else:
-        score_rsi = 0
+        score_rsi  = 0
         detail_rsi = f"RSI {rsi:.1f} (Zona Ekstrem <30 / >70)"
     total_score += score_rsi
     breakdown["rsi_zone"] = {
-        "score": score_rsi, "max": 2, "label": "Zona RSI M5", "detail": detail_rsi
+        "score": score_rsi, "max": 2,
+        "label": "Zona RSI M5", "detail": detail_rsi,
     }
 
-    # 4. Swing Distance (0-2)
+    # 3. Swing Distance (0-2)
+    # signals["swing_low"] / ["swing_high"] di-feed oleh caller (backtester & app.py)
+    # sebelum memanggil evaluate_entry() -- diperbaiki di Fase 4.3.
+    trend_h1    = signals.get("trend_h1", "SIDEWAYS")
+    trend_m5    = signals.get("trend",    "SIDEWAYS")
     close_price = signals.get("close", 0.0)
-    atr = signals.get("atr_14", 1.5)
-    sw_low = signals.get("swing_low")
-    sw_high = signals.get("swing_high")
+    atr         = signals.get("atr_14", 1.5)
+    sw_low      = signals.get("swing_low")
+    sw_high     = signals.get("swing_high")
 
     swing_dist = None
     if trend_h1 == "UPTREND" or trend_m5 == "UPTREND":
@@ -819,6 +829,7 @@ def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) 
         if sw_high is not None:
             swing_dist = abs(sw_high - close_price)
 
+    # Fallback: pakai swing yang tersedia jika arah tidak terdeteksi
     if swing_dist is None:
         if sw_low is not None:
             swing_dist = abs(close_price - sw_low)
@@ -828,26 +839,27 @@ def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) 
     if swing_dist is not None and atr > 0:
         atr_ratio = swing_dist / atr
         if atr_ratio >= 1.5:
-            score_swing = 2
-            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR — Luas)"
+            score_swing  = 2
+            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR -- Luas)"
         elif atr_ratio >= 0.8:
-            score_swing = 1
-            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR — Cukup)"
+            score_swing  = 1
+            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR -- Cukup)"
         else:
-            score_swing = 0
-            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR — Sempit)"
+            score_swing  = 0
+            detail_swing = f"Jarak Swing ${swing_dist:.2f} ({atr_ratio:.1f}x ATR -- Sempit)"
     else:
-        score_swing = 0
-        detail_swing = "Swing Tidak Ditemukan / Sempit (Fallback ATR)"
+        score_swing  = 0
+        detail_swing = "Swing Tidak Ditemukan / Data Tidak Tersedia"
     total_score += score_swing
     breakdown["swing_distance"] = {
-        "score": score_swing, "max": 2, "label": "Jarak ke Swing Structure", "detail": detail_swing
+        "score": score_swing, "max": 2,
+        "label": "Jarak ke Swing Structure", "detail": detail_swing,
     }
 
-    # Penentuan Label Quality
-    if total_score >= 6:
+    # Penentuan Label Quality (max=6, threshold proporsional dari skema 0-8 lama)
+    if total_score >= 5:
         quality_label = "STRONG"
-    elif total_score >= 4:
+    elif total_score >= 3:
         quality_label = "MODERATE"
     else:
         quality_label = "WEAK"
@@ -855,10 +867,9 @@ def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) 
     return {
         "setup_quality"       : quality_label,
         "setup_quality_score" : total_score,
-        "setup_quality_max"   : 8,
+        "setup_quality_max"   : 6,
         "quality_breakdown"   : breakdown,
     }
-
 
 
 # =============================================================================

@@ -55,7 +55,7 @@ import numpy as np
 import pandas as pd
 
 from engine.indicators   import run_all_indicators
-from engine.rule_engine  import evaluate_entry
+from engine.rule_engine  import evaluate_entry, calculate_setup_quality
 from engine.risk_manager import calculate_sl_tp, find_nearest_swing
 
 
@@ -562,6 +562,36 @@ def run_backtest(
         if not risk["valid"]:
             continue
 
+        # ── Fase 4.3: Inject swing data ke signals, lalu recompute setup quality ──
+        # calculate_sl_tp() sudah memanggil find_nearest_swing() -- hasilnya disimpan
+        # di risk["sl_swing_raw"]. Kita gunakan ini untuk mengisi signals["swing_low"]
+        # dan signals["swing_high"] sehingga calculate_setup_quality() bisa menghitung
+        # swing_distance yang benar (sebelumnya selalu 0 karena data tidak dikirim).
+        # Ini valid secara kausalitas: swing data tersedia di titik ini tanpa lookahead.
+        sw_raw = risk.get("sl_swing_raw")
+        if sw_raw is not None:
+            if arah == "BUY":
+                signals["swing_low"]  = sw_raw
+                signals["swing_high"] = None
+            else:  # SELL
+                signals["swing_low"]  = None
+                signals["swing_high"] = sw_raw
+        else:
+            signals["swing_low"]  = None
+            signals["swing_high"] = None
+
+        # Recompute quality score dengan swing data yang sudah tersedia
+        quality_dict = calculate_setup_quality(
+            signals = signals,
+            c_h1    = {},
+            c_m5    = {},
+            c_rsi   = {},
+        )
+        # Update decision fields dengan quality yang sudah di-refresh
+        decision["setup_quality"]       = quality_dict["setup_quality"]
+        decision["setup_quality_score"] = quality_dict["setup_quality_score"]
+        decision["quality_breakdown"]   = quality_dict["quality_breakdown"]
+
         sl       = risk["sl"]
         tp       = risk["tp"]
         jarak_sl = risk["jarak_sl"]
@@ -610,6 +640,9 @@ def run_backtest(
             rrr_realized = round(pnl_points / jarak_sl, 4) if jarak_sl > 0 else 0.0
             pnl_type     = "MTM"
 
+        # ── Ekstrak setup quality dari decision (sudah dihitung oleh evaluate_entry) ──
+        qbd = decision.get("quality_breakdown", {})
+
         trades.append({
             "entry_time"       : str(df_merged.index[i]),
             "exit_time"        : outcome_info["exit_time"],
@@ -637,6 +670,13 @@ def run_backtest(
             "trend_h1"         : signals["trend_h1"],
             "rsi_at_entry"     : round(signals["rsi_14"], 2),
             "ema_gap_pct"      : round(signals["ema_gap_pct"], 4),
+            # ── Setup Quality (Fase 4.3) -- 3 komponen (alignment dihapus) ─────
+            "setup_quality"           : decision.get("setup_quality"),
+            "setup_quality_score"     : decision.get("setup_quality_score"),
+            # Breakdown per-komponen (0-2 masing-masing)
+            "score_ema_gap"           : qbd.get("ema_gap",        {}).get("score"),
+            "score_rsi_zone"          : qbd.get("rsi_zone",       {}).get("score"),
+            "score_swing_distance"    : qbd.get("swing_distance", {}).get("score"),
         })
 
         # ── Update pointer "sedang dalam trade" ──────────────────────────────

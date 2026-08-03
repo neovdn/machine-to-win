@@ -46,7 +46,7 @@ from flask import Flask, render_template, request, jsonify
 from engine.data_fetcher  import initialize_mt5, get_candles, shutdown_mt5
 from engine.indicators    import run_all_indicators, get_latest_signals
 from engine.rule_engine   import evaluate_entry
-from engine.risk_manager  import calculate_sl_tp
+from engine.risk_manager  import calculate_sl_tp, find_nearest_swing
 from engine.history_logger import init_db, log_analysis, get_history, update_outcome
 
 
@@ -170,6 +170,19 @@ def analyze():
         h1_latest       = get_latest_signals(df_h1)
         signals["trend_h1"] = h1_latest["trend"]
         print(f"   H1 bias: {signals['trend_h1']} | M5 trigger: {signals['trend']}")
+
+        # ── Fase 4.3: Feed swing data ke signals sebelum evaluate_entry ──────
+        # Diperlukan agar calculate_setup_quality() bisa menghitung swing_distance.
+        # Panggil find_nearest_swing untuk kedua arah agar scoring bekerja apapun
+        # keputusan yang nanti dihasilkan evaluate_entry().
+        try:
+            signals["swing_low"]  = find_nearest_swing(df_m5, arah="BUY")
+            signals["swing_high"] = find_nearest_swing(df_m5, arah="SELL")
+            print(f"   Swing low: {signals['swing_low']} | Swing high: {signals['swing_high']}")
+        except Exception as sw_err:
+            signals["swing_low"]  = None
+            signals["swing_high"] = None
+            print(f"   ⚠️ Swing detection gagal ({sw_err}) -- swing_distance akan 0")
 
         # ── LANGKAH 5: Evaluasi kondisi entry (rule engine) ──────────────────
         print("→ Mengevaluasi kondisi entry...")
