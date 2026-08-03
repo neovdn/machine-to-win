@@ -159,6 +159,7 @@ def run_one_fold_validation(
     params     : dict,
     fold_label : str = "",
     volume_mode: str = "FILTER",
+    h1_min_ema_gap_pct: float = 0.0,
 ) -> dict:
     """
     Jalankan backtest parameter fixed di window validasi satu fold.
@@ -193,7 +194,7 @@ def run_one_fold_validation(
     # Hitung indikator & merge
     df_m5_val_ind = run_all_indicators(df_m5_val.copy())
     df_h1_val_ind = run_all_indicators(df_h1_val.copy())
-    df_val_merged = merge_h1_to_m5(df_m5_val_ind, df_h1_val_ind)
+    df_val_merged = merge_h1_to_m5(df_m5_val_ind, df_h1_val_ind, h1_min_ema_gap_pct=h1_min_ema_gap_pct)
 
     # Jalankan backtest dengan parameter fixed
     trades_df, summary = run_fast_backtest(
@@ -254,6 +255,10 @@ def main():
     parser.add_argument(
         "--val-months", type=int, default=1,
         help="Lama window validasi dalam bulan (default: 1)",
+    )
+    parser.add_argument(
+        "--h1-gap", type=float, default=0.0,
+        help="Threshold gap H1 independen (default: 0.0)",
     )
     args = parser.parse_args()
 
@@ -335,6 +340,7 @@ def main():
             val_end    = val_end,
             params     = FASE1_PARAMS,
             fold_label = f"Fold {fold_n}",
+            h1_min_ema_gap_pct = args.h1_gap,
         )
 
         elapsed = time.time() - t0

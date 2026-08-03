@@ -44,7 +44,7 @@ import MetaTrader5 as mt5
 from flask import Flask, render_template, request, jsonify
 
 from engine.data_fetcher  import initialize_mt5, get_candles, shutdown_mt5
-from engine.indicators    import run_all_indicators, get_latest_signals
+from engine.indicators    import run_all_indicators, get_latest_signals, detect_bias_h1
 from engine.rule_engine   import evaluate_entry
 from engine.risk_manager  import calculate_sl_tp, find_nearest_swing
 from engine.history_logger import init_db, log_analysis, get_history, update_outcome
@@ -165,10 +165,13 @@ def analyze():
         # ── LANGKAH 4b: Inject bias H1 ke signals ────────────────────────────
         # signals["trend_h1"] adalah sumber independen dari timeframe berbeda.
         # Ini memastikan rule engine punya dua input yang benar-benar terpisah:
-        #   - signals["trend"]    = trend M5 (trigger timing)
-        #   - signals["trend_h1"] = trend H1 (bias arah makro)
-        h1_latest       = get_latest_signals(df_h1)
-        signals["trend_h1"] = h1_latest["trend"]
+        #   - signals["trend"]    = trend M5 (trigger timing, gap-gated via detect_trend)
+        #   - signals["trend_h1"] = bias H1 (arah makro, position-based via detect_bias_h1)
+        #
+        # detect_bias_h1() TIDAK mewajibkan gap minimum — berbeda dari detect_trend().
+        # Ini sengaja: H1 hanya perlu menjawab "sisi mana?", bukan "sudah kuat trending?".
+        df_h1 = detect_bias_h1(df_h1)
+        signals["trend_h1"] = df_h1["bias_h1"].iloc[-1]
         print(f"   H1 bias: {signals['trend_h1']} | M5 trigger: {signals['trend']}")
 
         # ── Fase 4.3: Feed swing data ke signals sebelum evaluate_entry ──────

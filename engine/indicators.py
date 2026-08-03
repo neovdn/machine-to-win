@@ -249,6 +249,92 @@ def detect_trend(df: pd.DataFrame, min_ema_gap_pct: float = 0.05) -> pd.DataFram
 
 
 # =============================================================================
+# BAGIAN 3b: DETEKSI BIAS H1 (position-based, tanpa gap threshold)
+# =============================================================================
+
+def detect_bias_h1(df: pd.DataFrame, min_ema_gap_pct: float = 0.0) -> pd.DataFrame:
+    """
+    Mendeteksi bias arah makro dari data H1 berdasarkan posisi EMA murni —
+    dengan opsi menambahkan syarat gap minimum (min_ema_gap_pct) yang independen
+    dari M5. Default 0.0 = perilaku position-based murni (tanpa gap).
+
+    APA INI:
+        Fungsi ini menghasilkan kolom 'bias_h1' yang dipakai sebagai input
+        konteks arah untuk rule engine. Hasilnya akan mengisi signals["trend_h1"]
+        di pipeline live (web/app.py) maupun backtest (backtester.merge_h1_to_m5()).
+
+    KENAPA BERBEDA DARI detect_trend():
+        detect_trend() mewajibkan |ema_gap_pct| >= min_ema_gap_pct (default 0.05%)
+        sebelum melabeli kondisi sebagai UPTREND/DOWNTREND. Threshold ini masuk
+        akal untuk timeframe M5 sebagai FILTER TIMING (konfirmasi momentum sudah
+        melebar sebelum entry).
+
+        Untuk H1, kita bisa menset min_ema_gap_pct ke nilai yang lebih kecil
+        (misal 0.02%) agar lebih longgar dari M5 namun tetap memberikan
+        sedikit buffer terhadap noise (tidak sekadar 0.0%).
+
+    LOGIKA:
+        UPTREND   : EMA 9 > EMA 21 DAN close > EMA 21 DAN |gap_pct| >= min_ema_gap_pct
+        DOWNTREND : EMA 9 < EMA 21 DAN close < EMA 21 DAN |gap_pct| >= min_ema_gap_pct
+        SIDEWAYS  : semua kondisi lain (EMA cross belum terjadi, harga
+                    berada di antara dua EMA, atau gap belum melebar di atas threshold)
+
+    KAUSALITAS (zero look-ahead):
+        Logika ini sepenuhnya row-wise: setiap baris hanya membaca nilai
+        ema_9, ema_21, dan close dari baris yang sama (index i). Tidak ada
+        .shift(-N) atau penggunaan data masa depan. Setelah calculate_ema()
+        yang sudah terbukti causal, fungsi ini juga otomatis causal.
+
+    Parameter:
+        df              : DataFrame H1 yang sudah melewati calculate_ema() —
+                          harus punya kolom 'close', 'ema_9', 'ema_21'
+        min_ema_gap_pct : Threshold minimum |ema_gap_pct| agar bias dianggap
+                          valid (bukan SIDEWAYS). Default: 0.0.
+
+    Return:
+        DataFrame yang sama + kolom baru:
+            'bias_h1' : string "UPTREND", "DOWNTREND", atau "SIDEWAYS"
+
+    Contoh nilai dan artinya:
+        bias_h1 = "UPTREND"   → H1 mendukung posisi BUY (bias bullish aktif)
+        bias_h1 = "DOWNTREND" → H1 mendukung posisi SELL (bias bearish aktif)
+        bias_h1 = "SIDEWAYS"  → H1 tidak memberikan bias yang jelas — tunggu
+    """
+    _check_dataframe(df, required_columns=["close", "ema_9", "ema_21"])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Hitung jarak relatif antara EMA 9 dan EMA 21 (dalam persen)
+    # ─────────────────────────────────────────────────────────────────────────
+    gap_pct = (df["ema_9"] - df["ema_21"]) / df["ema_21"] * 100
+    
+    # Simpan raw gap H1 untuk debugging / audit opsional
+    df["ema_gap_pct_h1_raw"] = gap_pct
+
+    # Cek apakah jarak EMA cukup lebar untuk dianggap bias valid
+    gap_cukup = gap_pct.abs() >= min_ema_gap_pct
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Gunakan np.select persis seperti pola di detect_trend() agar konsisten.
+    # Urutan kondisi penting: kondisi pertama yang cocok = label yang dipakai.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    conditions = [
+        # UPTREND: EMA cepat di atas EMA lambat DAN harga di atas EMA lambat DAN gap cukup
+        (df["ema_9"] > df["ema_21"]) & (df["close"] > df["ema_21"]) & gap_cukup,
+
+        # DOWNTREND: EMA cepat di bawah EMA lambat DAN harga di bawah EMA lambat DAN gap cukup
+        (df["ema_9"] < df["ema_21"]) & (df["close"] < df["ema_21"]) & gap_cukup,
+    ]
+
+    choices = ["UPTREND", "DOWNTREND"]
+
+    # default = SIDEWAYS jika tidak ada kondisi yang cocok
+    df["bias_h1"] = np.select(conditions, choices, default="SIDEWAYS")
+
+    return df
+
+
+# =============================================================================
 # BAGIAN 4: ATR — Average True Range (Volatilitas)
 # =============================================================================
 

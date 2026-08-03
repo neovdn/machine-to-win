@@ -31,7 +31,7 @@ if sys.stdout.encoding != "utf-8":
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from engine.data_fetcher  import initialize_mt5, get_candles, shutdown_mt5
-from engine.indicators    import run_all_indicators, get_latest_signals
+from engine.indicators    import run_all_indicators, get_latest_signals, detect_bias_h1
 from engine.rule_engine   import evaluate_entry
 from engine.risk_manager  import calculate_sl_tp, find_nearest_swing
 
@@ -135,7 +135,10 @@ df_h1 = run_all_indicators(df_h1)   # → H1 indicators
 
 print("\n[ STEP 3 ] Evaluasi kondisi entry...")
 signals = get_latest_signals(df)
-signals["trend_h1"] = get_latest_signals(df_h1)["trend"]
+# Inject bias H1 ke signals — position-based (tanpa gap threshold)
+# detect_bias_h1() berbeda dari detect_trend(): tidak mewajibkan gap EMA cukup lebar.
+df_h1 = detect_bias_h1(df_h1)
+signals["trend_h1"] = df_h1["bias_h1"].iloc[-1]
 hasil   = evaluate_entry(signals)
 
 

@@ -221,6 +221,7 @@ def validate_no_lookahead(
 def merge_h1_to_m5(
     df_m5_ind : pd.DataFrame,
     df_h1_ind : pd.DataFrame,
+    h1_min_ema_gap_pct: float = 0.02,
 ) -> pd.DataFrame:
     """
     Attach nilai indikator H1 ke setiap baris M5 berdasarkan timestamp.
@@ -239,8 +240,20 @@ def merge_h1_to_m5(
 
         H1 candle masa depan TIDAK PERNAH bocor ke data M5.
 
+    SUMBER trend_h1 — detect_bias_h1() (position-based, bukan gap-gated):
+        trend_h1 sekarang berasal dari kolom 'bias_h1' yang dihasilkan oleh
+        detect_bias_h1(), bukan dari kolom 'trend' yang dihasilkan detect_trend().
+
+        Alasannya: detect_trend() menggunakan gate |ema_gap_pct| >= 0.05% sebelum
+        melabeli UPTREND/DOWNTREND. Gate ini tepat untuk M5 (trigger timing), tapi
+        terlalu ketat untuk H1 yang hanya berperan sebagai konteks arah makro.
+        detect_bias_h1() hanya mensyaratkan posisi relatif EMA + harga — tanpa
+        syarat gap minimum — sehingga bias H1 bisa diakui lebih awal saat trend
+        baru terbentuk (gap masih tipis tapi arah sudah konsisten).
+
     KOLOM H1 YANG DIATTACH:
-        trend_h1, ema_gap_pct_h1, ema_9_h1, ema_21_h1
+        trend_h1      (dari bias_h1 — position-based H1 classifier)
+        ema_gap_pct_h1, ema_9_h1, ema_21_h1
         (direname agar tidak clash dengan kolom M5 yang sama namanya)
 
     Parameter:
@@ -252,6 +265,9 @@ def merge_h1_to_m5(
     Return:
         DataFrame M5 dengan kolom tambahan dari H1 yang sudah diattach
     """
+    # Import lokal untuk menghindari circular import
+    from engine.indicators import detect_bias_h1
+
     # merge_asof butuh kolom, bukan DatetimeIndex
     m5_reset = df_m5_ind.reset_index()   # 'time' jadi kolom reguler
     h1_reset = df_h1_ind.reset_index()
@@ -260,9 +276,15 @@ def merge_h1_to_m5(
     m5_reset = m5_reset.sort_values("time").reset_index(drop=True)
     h1_reset = h1_reset.sort_values("time").reset_index(drop=True)
 
+    # Hitung bias_h1 (position-based) sebelum slicing kolom H1
+    # detect_bias_h1() membutuhkan kolom ema_9 dan ema_21 yang sudah ada
+    # (dijamin oleh run_all_indicators yang dipanggil sebelum fungsi ini)
+    h1_reset = detect_bias_h1(h1_reset, min_ema_gap_pct=h1_min_ema_gap_pct)
+
     # Pilih kolom H1 yang relevan, rename agar tidak clash
+    # 'bias_h1' (bukan 'trend') sebagai sumber trend_h1 — position-based
     h1_rename = {
-        "trend"       : "trend_h1",
+        "bias_h1"     : "trend_h1",       # position-based, tanpa gap threshold
         "ema_gap_pct" : "ema_gap_pct_h1",
         "ema_9"       : "ema_9_h1",
         "ema_21"      : "ema_21_h1",
@@ -422,6 +444,7 @@ def run_backtest(
     swing_clamp_min_atr : float | None = None,
     swing_clamp_max_atr : float | None = None,
     volume_mode         : str   = "FILTER",
+    h1_min_ema_gap_pct  : float = 0.02,
     verbose             : bool  = True,
 ) -> tuple:
     """
@@ -457,7 +480,7 @@ def run_backtest(
     # ─────────────────────────────────────────────────────────────────────────
     if verbose:
         print("[3/5] Merging H1 bias ke M5 (merge_asof backward)...")
-    df_merged = merge_h1_to_m5(df_m5_ind, df_h1_ind)
+    df_merged = merge_h1_to_m5(df_m5_ind, df_h1_ind, h1_min_ema_gap_pct=h1_min_ema_gap_pct)
 
     nan_h1_count = int(df_merged["trend_h1"].isna().sum())
     if nan_h1_count > 0 and verbose:
