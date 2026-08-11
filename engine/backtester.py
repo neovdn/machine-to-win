@@ -604,11 +604,13 @@ def run_backtest(
             signals["swing_high"] = None
 
         # Recompute quality score dengan swing data yang sudah tersedia
+        # Fase 7: teruskan df_slice agar candle pattern bisa dihitung
         quality_dict = calculate_setup_quality(
             signals = signals,
             c_h1    = {},
             c_m5    = {},
             c_rsi   = {},
+            df      = df_slice,   # Fase 7: dibutuhkan untuk candle pattern detection
         )
         # Update decision fields dengan quality yang sudah di-refresh
         decision["setup_quality"]       = quality_dict["setup_quality"]
@@ -693,13 +695,15 @@ def run_backtest(
             "trend_h1"         : signals["trend_h1"],
             "rsi_at_entry"     : round(signals["rsi_14"], 2),
             "ema_gap_pct"      : round(signals["ema_gap_pct"], 4),
-            # ── Setup Quality (Fase 4.3) -- 3 komponen (alignment dihapus) ─────
+            # ── Setup Quality (Fase 7) -- 4 komponen (candle_pattern ditambah) ─────
             "setup_quality"           : decision.get("setup_quality"),
             "setup_quality_score"     : decision.get("setup_quality_score"),
             # Breakdown per-komponen (0-2 masing-masing)
             "score_ema_gap"           : qbd.get("ema_gap",        {}).get("score"),
             "score_rsi_zone"          : qbd.get("rsi_zone",       {}).get("score"),
             "score_swing_distance"    : qbd.get("swing_distance", {}).get("score"),
+            "score_candle_pattern"    : qbd.get("candle_pattern", {}).get("score"),  # Fase 7
+            "pattern_detected"        : qbd.get("candle_pattern", {}).get("pattern_detected"),  # Fase 7
         })
 
         # ── Update pointer "sedang dalam trade" ──────────────────────────────

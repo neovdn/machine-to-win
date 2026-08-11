@@ -56,6 +56,10 @@ from datetime import datetime, timezone
 # session_filter diimport secara lazy di dalam evaluate_entry() untuk menghindari
 # circular import dan agar module ini tetap bisa ditest tanpa session_filter.
 
+# candle_patterns diimport secara lazy di dalam calculate_setup_quality() untuk
+# menjaga agar modul ini tetap bisa ditest tanpa dependensi candle_patterns.
+# (Fase 7: komponen ke-4 confidence scoring)
+
 
 # =============================================================================
 # KONSTANTA KONFIGURASI
@@ -517,7 +521,13 @@ def _check_volume_participation(signals: dict) -> dict:
 # FUNGSI UTAMA: EVALUATE ENTRY
 # =============================================================================
 
-def evaluate_entry(signals: dict, volume_mode: str = VOLUME_MODE_DEFAULT) -> dict:
+def evaluate_entry(
+    signals     : dict,
+    volume_mode : str          = VOLUME_MODE_DEFAULT,
+    df          = None,        # pd.DataFrame | None — DataFrame M5 yang di-slice hingga candle saat ini
+                               # (Fase 7) Diteruskan ke calculate_setup_quality() untuk candle pattern
+                               # detection. Default None = tidak ada candle pattern scoring.
+) -> dict:
     """
     Fungsi utama rule engine — evaluasi semua kondisi dan beri keputusan akhir.
 
@@ -701,7 +711,7 @@ def evaluate_entry(signals: dict, volume_mode: str = VOLUME_MODE_DEFAULT) -> dic
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 5b: Hitung Confidence / Setup Quality Scoring
     # ─────────────────────────────────────────────────────────────────────────
-    quality_res = calculate_setup_quality(signals, c_h1, c_m5, c_rsi)
+    quality_res = calculate_setup_quality(signals, c_h1, c_m5, c_rsi, df=df)
 
     # ─────────────────────────────────────────────────────────────────────────
     # TAHAP 6: Susun output lengkap
@@ -745,22 +755,44 @@ def evaluate_entry(signals: dict, volume_mode: str = VOLUME_MODE_DEFAULT) -> dic
 
 
 # =============================================================================
-# HELPER INTERNAL — Setup Quality Scoring (Auditable 0-6 Poin)
+# HELPER INTERNAL — Setup Quality Scoring (Auditable 0-8 Poin)
 # =============================================================================
 # Fase 4.3 (2026-08-03): alignment dihapus (tautologi struktural),
 # swing_distance diperbaiki (data kini di-feed dari pipeline sebelum evaluate_entry).
-# Skor maks: 8 -> 6. Threshold: STRONG >=5, MODERATE >=3, WEAK <3.
+# Skor maks setelah Fase 4.3: 6. Threshold: STRONG >=5, MODERATE >=3, WEAK <3.
+#
+# Fase 7 (2026-08-06): candle_pattern ditambah sebagai komponen ke-4 (0-2 poin).
+# Skor maks sekarang: 8. Threshold disesuaikan proporsional:
+#   STRONG lama  : >=5/6 = 83.3% -> 83.3% * 8 = 6.67 -> dibulatkan ke >=7
+#   MODERATE lama: >=3/6 = 50.0% -> 50.0% * 8 = 4.0  -> >=4
 
-def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) -> dict:
+def calculate_setup_quality(
+    signals              : dict,
+    c_h1                 : dict,
+    c_m5                 : dict,
+    c_rsi                : dict,
+    df                   = None,    # pd.DataFrame | None
+                                    # DataFrame M5 di-slice hingga candle saat ini.
+                                    # Dibutuhkan untuk candle pattern detection (Fase 7).
+                                    # None = komponen candle_pattern tidak dihitung (skor 0).
+    enable_candle_pattern: bool = True,
+                                    # Toggle komponen ke-4 (Fase 7).
+                                    # True  = aktifkan (default — scoring, bukan entry logic).
+                                    # False = nonaktifkan; berguna untuk validasi apples-to-apples
+                                    #         component ON vs OFF tanpa mengubah trade yang di-generate.
+) -> dict:
     """
-    Hitung setup_quality ("STRONG", "MODERATE", "WEAK") berbasis point-based scoring (0-6 Poin).
+    Hitung setup_quality ("STRONG", "MODERATE", "WEAK") berbasis point-based scoring (0-8 Poin).
 
-    3 Komponen Scoring (setelah Fase 4.3):
+    4 Komponen Scoring (setelah Fase 7):
         1. EMA Gap Strength  (0-2 pts): Kekuatan trend M5 dari gap EMA
         2. RSI Zone          (0-2 pts): RSI di zona netral vs ekstrem
         3. Swing Distance    (0-2 pts): Jarak harga ke swing terdekat vs ATR
                                         (data via signals["swing_low"]/["swing_high"]
                                         yang di-feed pipeline sebelum evaluate_entry)
+        4. Candlestick Pattern (0-2 pts): Pattern OHLC bullish/bearish di candle terakhir,
+                                          dikontekstualisasikan dengan jarak ke swing level.
+                                          (membutuhkan df yang sudah di-slice ke candle ini)
 
     CATATAN ARSITEKTUR (Fase 4.3):
         Komponen alignment H1-M5 dihapus -- terbukti tautologi secara struktural:
@@ -769,10 +801,24 @@ def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) 
         Zero variance, tidak bisa membedakan setup apapun. Bukan bug data, tapi
         konsekuensi matematis dari arsitektur filter entry.
 
-    Threshold (proporsional dari skema 0-8 lama, max 6):
-        STRONG   >= 5  (dari >=6/8=75% -> 75%*6=4.5 -> dibulatkan ke 5)
-        MODERATE >= 3  (dari >=4/8=50% -> 50%*6=3.0)
-        WEAK      < 3
+    CATATAN ARSITEKTUR (Fase 7 — komponen ke-4):
+        Komponen candle_pattern sengaja didefinisikan dari sumber OHLC murni (bukan
+        turunan EMA/RSI/swing), sehingga risiko redundansi struktural kecil.
+        Namun uji korelasi antar-komponen tetap WAJIB dilakukan di tahap validasi
+        7.3 sebelum dianggap lolos (pelajaran dari kasus alignment Fase 4.3).
+
+    Threshold Fase 7 (max=8, proporsional dari skema lama max=6):
+        STRONG   >= 7  (dari >=5/6=83.3% -> 83.3%*8=6.67 -> dibulatkan ke 7)
+        MODERATE >= 4  (dari >=3/6=50.0% -> 50.0%*8=4.0)
+        WEAK      < 4
+
+    Parameter:
+        signals               : dict dari get_latest_signals() / pipeline backtester
+        c_h1, c_m5, c_rsi     : dict hasil _check_*() (saat ini tidak dipakai langsung
+                                di scoring, tapi dipertahankan signature-nya untuk
+                                konsistensi dengan caller)
+        df                    : DataFrame M5 di-slice s/d candle saat ini (bisa None)
+        enable_candle_pattern : bool — toggle komponen ke-4 (default True)
     """
     breakdown   = {}
     total_score = 0
@@ -856,10 +902,65 @@ def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) 
         "label": "Jarak ke Swing Structure", "detail": detail_swing,
     }
 
-    # Penentuan Label Quality (max=6, threshold proporsional dari skema 0-8 lama)
-    if total_score >= 5:
+    # 4. Candlestick Pattern (0-2) — Fase 7
+    # Sumber: OHLC candle terakhir di df (murni dari price action, bukan EMA/RSI/swing)
+    # Arah kandidat: ikuti pola penentuan arah yang sama dengan komponen swing_distance
+    # (cek trend_h1 dulu, lalu trend_m5 sebagai fallback — bukan duplikat logic,
+    #  tapi referensi yang sama agar semua komponen menilai arah yang konsisten).
+    if enable_candle_pattern and df is not None:
+        # Tentukan arah_kandidat untuk pattern detection — pola identik dengan swing_distance
+        if trend_h1 == "UPTREND" or (trend_h1 == "SIDEWAYS" and trend_m5 == "UPTREND"):
+            arah_cek = "BUY"
+        elif trend_h1 == "DOWNTREND" or (trend_h1 == "SIDEWAYS" and trend_m5 == "DOWNTREND"):
+            arah_cek = "SELL"
+        else:
+            arah_cek = "NETRAL"  # keduanya SIDEWAYS — tidak ada pattern yang dicek
+
+        try:
+            # Import lazy untuk mencegah circular import dan dependensi tidak perlu
+            from engine.candle_patterns import calculate_candle_pattern_score
+            cp_result = calculate_candle_pattern_score(
+                df            = df,
+                arah_kandidat = arah_cek,
+                swing_low     = sw_low,
+                swing_high    = sw_high,
+                atr_value     = atr,
+            )
+        except Exception as cp_err:
+            # Graceful degradation: jika candle_patterns gagal diimport atau error,
+            # jangan crash seluruh scoring — catat skor 0 dengan keterangan error
+            cp_result = {
+                "score"            : 0,
+                "max"              : 2,
+                "label"            : "Candlestick Pattern",
+                "detail"           : f"Error: {cp_err}",
+                "pattern_detected" : None,
+            }
+
+        total_score += cp_result["score"]
+        breakdown["candle_pattern"] = cp_result
+    else:
+        # df tidak tersedia atau komponen dinonaktifkan → skor 0, catat alasan
+        if not enable_candle_pattern:
+            cp_detail = "Komponen candle_pattern dinonaktifkan (enable_candle_pattern=False)"
+        else:
+            cp_detail = "DataFrame tidak tersedia — candle pattern tidak dihitung"
+        breakdown["candle_pattern"] = {
+            "score"            : 0,
+            "max"              : 2,
+            "label"            : "Candlestick Pattern",
+            "detail"           : cp_detail,
+            "pattern_detected" : None,
+        }
+        # total_score tidak bertambah (skor 0 implisit)
+
+    # Penentuan Label Quality
+    # Fase 7: max=8, threshold proporsional dari skema Fase 4.3 (max=6):
+    #   STRONG lama  : >=5/6 = 83.3% -> 83.3% * 8 = 6.67 -> dibulatkan ke >=7
+    #   MODERATE lama: >=3/6 = 50.0% -> 50.0% * 8 = 4.0  -> >=4
+    if total_score >= 7:
         quality_label = "STRONG"
-    elif total_score >= 3:
+    elif total_score >= 4:
         quality_label = "MODERATE"
     else:
         quality_label = "WEAK"
@@ -867,7 +968,7 @@ def calculate_setup_quality(signals: dict, c_h1: dict, c_m5: dict, c_rsi: dict) 
     return {
         "setup_quality"       : quality_label,
         "setup_quality_score" : total_score,
-        "setup_quality_max"   : 6,
+        "setup_quality_max"   : 8,
         "quality_breakdown"   : breakdown,
     }
 
