@@ -23,6 +23,7 @@ from engine.data_fetcher import load_candles_csv
 from engine.indicators import run_all_indicators
 from engine.rule_engine import evaluate_entry
 from engine.risk_manager import calculate_sl_tp
+from engine.zone_detector import detect_consolidation_zone
 from engine.backtester import (
     merge_h1_to_m5,
     validate_no_lookahead,
@@ -46,6 +47,9 @@ def run_fast_backtest(
     max_candles: int = MAX_FORWARD_CANDLES,
     warm_up: int = WARM_UP_CANDLES,
     volume_mode: str = "FILTER",
+    enable_breakout_trigger: bool = True,
+                                        # Toggle breakout trigger (Fase 9).
+                                        # False = untuk Tahap 0 regression check.
 ) -> tuple:
     """
     Eksekusi backtest super cepat tanpa menghitung ulang indikator.
@@ -65,9 +69,11 @@ def run_fast_backtest(
         signals = {
             "time"        : df_merged.index[i],
             "close"       : float(row["close"]),
+            "open"        : float(row["open"]),
             "ema_9"       : float(row["ema_9"]),
             "ema_21"      : float(row["ema_21"]),
             "rsi_14"      : float(row["rsi_14"]),
+            "atr_14"      : float(row["atr_14"]),
             "trend"       : str(row["trend"]),
             "ema_gap_pct" : float(row["ema_gap_pct"]),
             "trend_h1"    : str(row["trend_h1"]),
@@ -82,7 +88,22 @@ def run_fast_backtest(
         if has_nan:
             continue
 
-        decision = evaluate_entry(signals, volume_mode=volume_mode)
+        # Hitung zona konsolidasi dari candle SEBELUM candle i (anti-circular per 9.1)
+        # Parameter identik dengan backtester.py — TIDAK andalkan default —
+        # agar backtest dan live production selalu pakai parameter yang sama.
+        zone = detect_consolidation_zone(
+            df_m5_ind, idx=i - 1,
+            lookback=20,
+            max_range_atr_ratio=2.5,
+            min_duration_candles=10,
+        )
+
+        decision = evaluate_entry(
+            signals,
+            volume_mode=volume_mode,
+            zone=zone,
+            enable_breakout_trigger=enable_breakout_trigger,
+        )
         if decision["keputusan"] not in ("BUY", "SELL"):
             continue
 

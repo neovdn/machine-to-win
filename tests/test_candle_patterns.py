@@ -490,9 +490,56 @@ class TestHelpers(unittest.TestCase):
 
 class TestIntegrasiQualityScoring(unittest.TestCase):
 
-    def test_max_score_berubah_jadi_8(self):
+    def test_default_call_exclude_candle_pattern(self):
         """
-        Verifikasi bahwa calculate_setup_quality() mengembalikan max=8 (Fase 7).
+        Panggil calculate_setup_quality() TANPA argumen enable_candle_pattern
+        (pure default). Verifikasi:
+          - breakdown TIDAK punya key 'candle_pattern'
+          - setup_quality_max == 8 (4 komponen aktif x 2 poin)
+          - hanya 4 key di breakdown: ema_gap, rsi_zone, swing_distance, trigger_confluence
+        Ini adalah test eksplisit untuk keputusan freeze Fase 7.
+        """
+        from engine.rule_engine import calculate_setup_quality
+
+        signals = {
+            "ema_gap_pct" : 0.20,
+            "rsi_14"      : 50.0,
+            "close"       : 100.0,
+            "atr_14"      : 2.0,
+            "trend_h1"    : "UPTREND",
+            "trend"       : "UPTREND",
+            "swing_low"   : 90.0,
+            "swing_high"  : None,
+        }
+        df_dummy = make_df([
+            {"open": 95.0, "high": 96.0, "low": 94.0, "close": 95.5},
+            {"open": 99.0, "high": 101.0, "low": 98.5, "close": 100.0},
+        ], atr=2.0)
+
+        # Panggil TANPA enable_candle_pattern — murni default
+        res = calculate_setup_quality(signals, {}, {}, {}, df=df_dummy)
+
+        # Komponen candle_pattern harus TIDAK ada di breakdown (bukan sekedar skor 0)
+        self.assertNotIn(
+            "candle_pattern", res["quality_breakdown"],
+            "candle_pattern tidak boleh ada di breakdown pada kondisi default (freeze Fase 7)"
+        )
+        # Max harus 8 (4 komponen x 2 poin)
+        self.assertEqual(
+            res["setup_quality_max"], 8,
+            "Default max harus 8 (ema_gap + rsi_zone + swing_distance + trigger_confluence)"
+        )
+        # Tepat 4 komponen di breakdown
+        expected_keys = {"ema_gap", "rsi_zone", "swing_distance", "trigger_confluence"}
+        self.assertEqual(
+            set(res["quality_breakdown"].keys()), expected_keys,
+            f"Breakdown harus tepat 4 komponen, bukan: {set(res['quality_breakdown'].keys())}"
+        )
+
+    def test_max_score_dengan_candle_pattern_aktif_jadi_10(self):
+        """
+        Verifikasi bahwa enable_candle_pattern=True (eksplisit) menghasilkan max=10
+        karena 5 komponen aktif (Fase 9). Ini adalah jalur RISET, bukan live default.
         """
         from engine.rule_engine import calculate_setup_quality
 
@@ -503,22 +550,82 @@ class TestIntegrasiQualityScoring(unittest.TestCase):
             "atr_14"      : 2.0,
             "trend_h1"    : "UPTREND",
             "trend"       : "UPTREND",
-            "swing_low"   : 90.0,   # dist = 10.0, atr=2.0 → ratio=5x → score 2
+            "swing_low"   : 90.0,   # dist=10.0, atr=2.0 → ratio=5x → score 2
             "swing_high"  : None,
         }
         df_dummy = make_df([
-            {"open": 95.0, "high": 96.0, "low": 94.0, "close": 95.5},  # candle sebelumnya
-            {"open": 99.0, "high": 101.0, "low": 98.5, "close": 100.0},  # candle saat ini
+            {"open": 95.0, "high": 96.0, "low": 94.0, "close": 95.5},
+            {"open": 99.0, "high": 101.0, "low": 98.5, "close": 100.0},
         ], atr=2.0)
 
+        # Eksplisit aktifkan candle_pattern — bukan default, jalur riset
         res = calculate_setup_quality(signals, {}, {}, {}, df=df_dummy, enable_candle_pattern=True)
-        self.assertEqual(res["setup_quality_max"], 8, "Max harus 8 setelah Fase 7")
+        # 5 komponen aktif → max=10
+        self.assertEqual(res["setup_quality_max"], 10, "Max harus 10 ketika candle_pattern aktif (5 komponen)")
         self.assertIn("candle_pattern", res["quality_breakdown"])
+        self.assertIn("trigger_confluence", res["quality_breakdown"])
 
-    def test_toggle_off_skor_sama_dengan_3_komponen(self):
+    def test_default_skema_max8_threshold_strong7_moderate4(self):
         """
-        Dengan enable_candle_pattern=False, skor hanya dari 3 komponen (max=6 poin efektif).
-        setup_quality_max masih 8 (field tidak berubah), tapi candle_pattern score=0.
+        Skema default (candle_pattern OFF): max=8, STRONG>=7, MODERATE>=4.
+        Verifikasi bahwa skor 6 dari 8 = MODERATE (bukan STRONG), dan skor
+        7 dari 8 = STRONG. Threshold harus dihitung dinamis dari komponen aktif.
+        """
+        from engine.rule_engine import calculate_setup_quality
+
+        # Skor 6: ema_gap=2, rsi=2, swing=2, trigger_confluence=0 (trigger_source=None)
+        # Default: candle_pattern OFF → max=8, STRONG>=7, MODERATE>=4 → skor 6 = MODERATE
+        signals = {
+            "ema_gap_pct" : 0.20,   # 2 pts
+            "rsi_14"      : 50.0,   # 2 pts
+            "close"       : 100.0,
+            "atr_14"      : 2.0,
+            "trend_h1"    : "UPTREND",
+            "trend"       : "UPTREND",
+            "swing_low"   : 90.0,   # 2 pts
+            "swing_high"  : None,
+        }
+        res = calculate_setup_quality(signals, {}, {}, {})  # default: candle_pattern=False
+        # trigger_confluence=0 (trigger_source=None) → total=6, max=8, MODERATE>=4 → MODERATE
+        self.assertEqual(res["setup_quality_score"], 6)
+        self.assertEqual(res["setup_quality_max"], 8)
+        self.assertEqual(res["setup_quality"], "MODERATE")
+
+        # Skor 7: sama + trigger_source="EMA_GAP" (trigger_confluence=1) → 2+2+2+1=7 → STRONG
+        res7 = calculate_setup_quality(signals, {}, {}, {}, trigger_source="EMA_GAP")
+        self.assertEqual(res7["setup_quality_score"], 7)
+        self.assertEqual(res7["setup_quality"], "STRONG")
+
+    def test_default_weak_skor_rendah(self):
+        """
+        Skema default (candle_pattern OFF, max=8): skor rendah harus WEAK.
+        MODERATE >= ceil(50% * 8) = 4, jadi skor 2 = WEAK.
+        """
+        from engine.rule_engine import calculate_setup_quality
+
+        signals = {
+            "ema_gap_pct" : 0.10,   # 1 pt (0.08-0.15)
+            "rsi_14"      : 35.0,   # 1 pt (30-40)
+            "close"       : 100.0,
+            "atr_14"      : 2.0,
+            "trend_h1"    : "SIDEWAYS",
+            "trend"       : "SIDEWAYS",
+            "swing_low"   : None,
+            "swing_high"  : None,
+        }
+        # swing_distance=0, candle_pattern OFF (default), trigger_confluence=0
+        # total = 1+1+0+0 = 2; max=8; MODERATE>=4 → WEAK
+        res = calculate_setup_quality(signals, {}, {}, {})  # pure default
+        self.assertEqual(res["setup_quality_score"], 2)
+        self.assertEqual(res["setup_quality_max"], 8)
+        self.assertEqual(res["setup_quality"], "WEAK")
+
+    def test_toggle_off_skor_sama_dengan_3_komponen_dan_trigger(self):
+        """
+        Dengan enable_candle_pattern=False eksplisit + df tersedia:
+        - candle_pattern TIDAK ada di breakdown (sesuai logika freeze: komponen off = tidak dicatat)
+        - total = ema_gap + rsi_zone + swing_distance + trigger_confluence (tanpa candle)
+        - max=8 (4 komponen x 2 poin)
         """
         from engine.rule_engine import calculate_setup_quality
 
@@ -538,62 +645,17 @@ class TestIntegrasiQualityScoring(unittest.TestCase):
         ], atr=2.0)
 
         res_off = calculate_setup_quality(signals, {}, {}, {}, df=df_dummy, enable_candle_pattern=False)
-        self.assertEqual(res_off["quality_breakdown"]["candle_pattern"]["score"], 0)
+        # candle_pattern OFF → tidak ada di breakdown
+        self.assertNotIn("candle_pattern", res_off["quality_breakdown"])
+        # 3 komponen non-trigger tetap ada dan skornya benar
         self.assertEqual(res_off["quality_breakdown"]["ema_gap"]["score"], 2)
         self.assertEqual(res_off["quality_breakdown"]["rsi_zone"]["score"], 2)
         self.assertEqual(res_off["quality_breakdown"]["swing_distance"]["score"], 2)
-        self.assertEqual(res_off["setup_quality_score"], 6)  # hanya 3 komponen
-
-    def test_threshold_strong_7(self):
-        """
-        Verifikasi threshold STRONG sekarang >= 7 (bukan >= 5 lama).
-        Skor 6 seharusnya MODERATE, skor 7 seharusnya STRONG.
-        """
-        from engine.rule_engine import calculate_setup_quality
-
-        # Skor 6: ema_gap=2, rsi=2, swing=2, candle=0 → total=6 → harus MODERATE (bukan STRONG)
-        signals = {
-            "ema_gap_pct" : 0.20,   # 2 pts
-            "rsi_14"      : 50.0,   # 2 pts
-            "close"       : 100.0,
-            "atr_14"      : 2.0,
-            "trend_h1"    : "UPTREND",
-            "trend"       : "UPTREND",
-            "swing_low"   : 90.0,   # 2 pts
-            "swing_high"  : None,
-        }
-        # df tanpa pattern bullish yang valid → candle_pattern score 0
-        df_no_pattern = make_df([
-            {"open": 100.2, "high": 100.5, "low": 99.5, "close": 100.3},  # candle biasa
-            {"open": 100.3, "high": 100.7, "low": 100.1, "close": 100.5}, # candle biasa
-        ], atr=2.0)
-
-        res = calculate_setup_quality(signals, {}, {}, {}, df=df_no_pattern, enable_candle_pattern=True)
-        # Total: 2+2+2+0 = 6 → MODERATE (threshold STRONG >= 7)
-        self.assertEqual(res["setup_quality_score"], 6)
-        self.assertEqual(res["setup_quality"], "MODERATE")
-
-    def test_threshold_weak_bawah_4(self):
-        """
-        Skor 3 harus WEAK (threshold MODERATE >= 4 setelah Fase 7).
-        """
-        from engine.rule_engine import calculate_setup_quality
-
-        signals = {
-            "ema_gap_pct" : 0.10,   # 1 pt (0.08-0.15)
-            "rsi_14"      : 35.0,   # 1 pt (30-40)
-            "close"       : 100.0,
-            "atr_14"      : 2.0,
-            "trend_h1"    : "SIDEWAYS",
-            "trend"       : "SIDEWAYS",
-            "swing_low"   : None,
-            "swing_high"  : None,
-        }
-        # swing_distance = 0, candle_pattern = 0 (tidak ada df)
-        res = calculate_setup_quality(signals, {}, {}, {}, df=None, enable_candle_pattern=True)
-        # Total: 1+1+0+0 = 2 → WEAK
-        self.assertEqual(res["setup_quality_score"], 2)
-        self.assertEqual(res["setup_quality"], "WEAK")
+        # trigger_confluence=0 (trigger_source=None default)
+        self.assertEqual(res_off["quality_breakdown"]["trigger_confluence"]["score"], 0)
+        # total=6, max=8
+        self.assertEqual(res_off["setup_quality_score"], 6)
+        self.assertEqual(res_off["setup_quality_max"], 8)
 
 
 if __name__ == "__main__":

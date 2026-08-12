@@ -48,6 +48,7 @@ from engine.indicators    import run_all_indicators, get_latest_signals, detect_
 from engine.rule_engine   import evaluate_entry
 from engine.risk_manager  import calculate_sl_tp, find_nearest_swing
 from engine.history_logger import init_db, log_analysis, get_history, update_outcome
+from engine.zone_detector import detect_consolidation_zone
 
 
 # =============================================================================
@@ -174,6 +175,10 @@ def analyze():
         signals["trend_h1"] = df_h1["bias_h1"].iloc[-1]
         print(f"   H1 bias: {signals['trend_h1']} | M5 trigger: {signals['trend']}")
 
+        # ── Tambah open dan atr_14 ke signals (dibutuhkan breakout trigger Fase 9) ──
+        signals["open"]   = float(df_m5["open"].iloc[-1])
+        signals["atr_14"] = float(df_m5["atr_14"].iloc[-1])
+
         # ── Fase 4.3: Feed swing data ke signals sebelum evaluate_entry ──────
         # Diperlukan agar calculate_setup_quality() bisa menghitung swing_distance.
         # Panggil find_nearest_swing untuk kedua arah agar scoring bekerja apapun
@@ -187,9 +192,25 @@ def analyze():
             signals["swing_high"] = None
             print(f"   ⚠️ Swing detection gagal ({sw_err}) -- swing_distance akan 0")
 
+        # ── Fase 9: Hitung zona konsolidasi sebelum evaluate_entry ───────────
+        # idx = len(df_m5) - 2 = candle SEBELUM candle terakhir (anti-lookahead / anti-circular)
+        # Parameter ditulis eksplisit — TIDAK andalkan default — agar identik
+        # dengan yang dipakai di backtester.py (jaga konsistensi backtest vs live).
+        try:
+            zone = detect_consolidation_zone(
+                df_m5, idx=len(df_m5) - 2,
+                lookback=20,
+                max_range_atr_ratio=2.5,
+                min_duration_candles=10,
+            )
+            print(f"   Zone: {zone['keterangan']}")
+        except Exception as zone_err:
+            zone = None
+            print(f"   ⚠️ Zone detection gagal ({zone_err}) -- breakout trigger dinonaktifkan")
+
         # ── LANGKAH 5: Evaluasi kondisi entry (rule engine) ──────────────────
         print("→ Mengevaluasi kondisi entry...")
-        decision = evaluate_entry(signals)
+        decision = evaluate_entry(signals, zone=zone)
 
         # ── LANGKAH 6: Hitung SL/TP (BUY, SELL, atau Acuan Proyeksi jika WAIT) ───
         print(f"→ Menghitung acuan SL/TP & Manajemen Risiko ({decision['keputusan']})...")
@@ -304,9 +325,10 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
 
     Struktur output:
         result["keputusan"]           : "BUY" / "SELL" / "WAIT"
+        result["trigger_source"]      : "EMA_GAP" / "BREAKOUT" / "BOTH" / None  (Fase 9)
         result["setup_quality"]       : "STRONG" / "MODERATE" / "WEAK"
-        result["setup_quality_score"] : int (0-8)
-        result["quality_breakdown"]   : dict breakdown 4 komponen
+        result["setup_quality_score"] : int (0-10)
+        result["quality_breakdown"]   : dict breakdown 5 komponen
         result["signals"]             : dict nilai indikator terbaru
         result["kondisi"]             : list kondisi dengan status terpenuhi/tidak
         result["alasan_entry"]        : list string alasan entry
@@ -339,6 +361,17 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
         "tipe"       : "entry",  # kondisi entry (bukan filter)
     })
 
+    # Kondisi 3: Breakout Trigger (Fase 9) — opsional, hanya ada jika zone tersedia
+    c_breakout = decision["kondisi_detail"].get("breakout_trigger")
+    if c_breakout is not None:
+        kondisi_list.append({
+            "nama"       : "Breakout Trigger",
+            "terpenuhi"  : c_breakout["terpenuhi"],
+            "keterangan" : c_breakout["keterangan"],
+            "arah"       : c_breakout["arah"],
+            "tipe"       : "entry",  # trigger alternatif (bukan filter)
+        })
+
     # Filter RSI
     c_rsi = decision["kondisi_detail"]["rsi_filter"]
     kondisi_list.append({
@@ -359,9 +392,10 @@ def _build_result(signals: dict, decision: dict, risk: dict | None) -> dict:
     return {
         "keputusan"           : keputusan,
         "arah"                : decision.get("arah"),            # "LONG" / "SHORT" / None
+        "trigger_source"      : decision.get("trigger_source"),  # Fase 9
         "setup_quality"       : decision.get("setup_quality", "WEAK"),
         "setup_quality_score" : decision.get("setup_quality_score", 0),
-        "setup_quality_max"   : decision.get("setup_quality_max", 8),
+        "setup_quality_max"   : decision.get("setup_quality_max", 10),
         "quality_breakdown"   : decision.get("quality_breakdown", {}),
         "signals"             : signals,
         "kondisi"             : kondisi_list,

@@ -57,6 +57,7 @@ import pandas as pd
 from engine.indicators   import run_all_indicators
 from engine.rule_engine  import evaluate_entry, calculate_setup_quality
 from engine.risk_manager import calculate_sl_tp, find_nearest_swing
+from engine.zone_detector import detect_consolidation_zone
 
 
 # =============================================================================
@@ -445,6 +446,11 @@ def run_backtest(
     swing_clamp_max_atr : float | None = None,
     volume_mode         : str   = "FILTER",
     h1_min_ema_gap_pct  : float = 0.02,
+    enable_breakout_trigger: bool = True,
+                                        # Toggle breakout trigger (Fase 9).
+                                        # True  = aktifkan (default).
+                                        # False = nonaktifkan; dipakai untuk Tahap 0 regression check
+                                        #         (trade set harus identik 100% dengan baseline).
     verbose             : bool  = True,
 ) -> tuple:
     """
@@ -536,9 +542,11 @@ def run_backtest(
         signals = {
             "time"        : df_merged.index[i],
             "close"       : float(row["close"]),
+            "open"        : float(row["open"]),
             "ema_9"       : float(row["ema_9"]),
             "ema_21"      : float(row["ema_21"]),
             "rsi_14"      : float(row["rsi_14"]),
+            "atr_14"      : float(row["atr_14"]),
             "trend"       : str(row["trend"]),
             "ema_gap_pct" : float(row["ema_gap_pct"]),
             "trend_h1"    : str(row["trend_h1"]),
@@ -555,7 +563,22 @@ def run_backtest(
 
         n_evaluated += 1
 
-        decision = evaluate_entry(signals, volume_mode=volume_mode)
+        # Hitung zona konsolidasi dari candle SEBELUM candle i (anti-circular per 9.1)
+        # Parameter ditulis eksplisit — TIDAK andalkan default — agar backtest dan
+        # live production selalu pakai parameter yang sama (lihat catatan 9.1).
+        zone = detect_consolidation_zone(
+            df_m5_ind, idx=i - 1,
+            lookback=20,
+            max_range_atr_ratio=2.5,
+            min_duration_candles=10,
+        )
+
+        decision = evaluate_entry(
+            signals,
+            volume_mode=volume_mode,
+            zone=zone,
+            enable_breakout_trigger=enable_breakout_trigger,
+        )
 
         if decision["keputusan"] not in ("BUY", "SELL"):
             continue
@@ -605,12 +628,14 @@ def run_backtest(
 
         # Recompute quality score dengan swing data yang sudah tersedia
         # Fase 7: teruskan df_slice agar candle pattern bisa dihitung
+        # Fase 9: teruskan trigger_source untuk komponen ke-5 (trigger_confluence)
         quality_dict = calculate_setup_quality(
-            signals = signals,
-            c_h1    = {},
-            c_m5    = {},
-            c_rsi   = {},
-            df      = df_slice,   # Fase 7: dibutuhkan untuk candle pattern detection
+            signals        = signals,
+            c_h1           = {},
+            c_m5           = {},
+            c_rsi          = {},
+            df             = df_slice,
+            trigger_source = decision.get("trigger_source"),
         )
         # Update decision fields dengan quality yang sudah di-refresh
         decision["setup_quality"]       = quality_dict["setup_quality"]
@@ -704,6 +729,8 @@ def run_backtest(
             "score_swing_distance"    : qbd.get("swing_distance", {}).get("score"),
             "score_candle_pattern"    : qbd.get("candle_pattern", {}).get("score"),  # Fase 7
             "pattern_detected"        : qbd.get("candle_pattern", {}).get("pattern_detected"),  # Fase 7
+            # Fase 9: trigger source untuk breakdown per sumber trigger
+            "trigger_source"          : decision.get("trigger_source"),
         })
 
         # ── Update pointer "sedang dalam trade" ──────────────────────────────
