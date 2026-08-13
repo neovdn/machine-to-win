@@ -37,6 +37,10 @@ LOGIKA MURNI — TIDAK ADA AI / MACHINE LEARNING.
 import pandas as pd
 import numpy as np
 
+# Import fungsi S&D (Fase 11) — lazy path via function-level import untuk
+# menghindari circular import dan menjaga modul ini tetap berdiri sendiri.
+# find_nearest_sd_zone diimport di dalam calculate_sl_tp saat sl_source="SD_ZONE".
+
 
 # =============================================================================
 # KONSTANTA KONFIGURASI DEFAULT (Profile: scalp_m5)
@@ -140,27 +144,53 @@ def calculate_sl_tp(
     swing_clamp_max_atr : float | None = None,
     swing_buffer        : float | None = None,
     tick_info           : dict | None = None,
+    sl_source           : str = "SWING",
+    sd_impulsive_ratio  : float | None = None,
+                                        # Fase 11.3: Threshold untuk zone origin.
+                                        # None = gunakan default dari module supply_demand.
+                                        # Sumber referensi SL.
+                                        # "SWING" (default) → perilaku lama, identik 100%
+                                        #   dengan sebelum Fase 11.
+                                        # "SD_ZONE" → gunakan Supply & Demand zone sebagai
+                                        #   referensi SL (Fase 11). Default HARUS "SWING"
+                                        #   sampai divalidasi dan disetujui eksplisit.
 ) -> dict:
     """
-    Hitung SL dan TP menggunakan pendekatan ATR-Clamped Swing.
+    Hitung SL dan TP menggunakan pendekatan ATR-Clamped Swing atau S&D Zone.
 
     ALUR KALKULASI:
         1. Muat parameter default dari RISK_PROFILES[profile]. Parameter yang
            dilewatkan secara eksplisit akan me-override nilai default profile.
         2. Tentukan harga entry eksekusi (ask untuk BUY, bid untuk SELL jika tick_info ada).
-        3. Cari level swing raw (swing low untuk BUY, swing high untuk SELL).
-        4. Jika swing ditemukan:
-             - Jarak raw = entry - (swing_low - buffer) [BUY] atau (swing_high + buffer) - entry [SELL]
-             - Clamp jarak raw ke rentang [min_dist, max_dist] di mana:
-                 min_dist = swing_clamp_min_atr × ATR
-                 max_dist = swing_clamp_max_atr × ATR
-             - SL final = entry - dist_clamped [BUY] atau entry + dist_clamped [SELL]
-        5. Jika swing tidak ditemukan:
-             - Fallback ke ATR: jarak_sl = atr_multiplier × ATR
-        6. TP = entry ± (jarak_sl × rrr_min)
+        3a. Jika sl_source="SWING" (default):
+              Cari level swing raw (swing low untuk BUY, swing high untuk SELL).
+              Jika ditemukan:
+                - Jarak raw = entry - (swing_low - buffer) [BUY]
+                            atau (swing_high + buffer) - entry [SELL]
+                - Clamp jarak raw ke [min_dist, max_dist] di mana:
+                    min_dist = swing_clamp_min_atr × ATR
+                    max_dist = swing_clamp_max_atr × ATR
+                - SL final = entry ± dist_clamped
+              Jika tidak ditemukan: fallback ke ATR.
+        3b. Jika sl_source="SD_ZONE" (Fase 11):
+              Panggil find_nearest_sd_zone() dari engine.supply_demand.
+              Jika zona ditemukan:
+                - Level SL raw = zona.level (sudah include buffer)
+                - Hitung jarak raw dari entry ke level SL raw
+                - Clamp dengan range ATR yang SAMA (SWING_CLAMP_MIN_ATR / MAX_ATR)
+                - SL final = entry ± dist_clamped
+              Jika tidak ditemukan: fallback ke ATR (identik dengan swing fallback).
+              sl_method = "SD_ZONE" di output (bukan "SWING") agar audit trail jelas.
+        4. TP = entry ± (jarak_sl × rrr_min)
+
+    Parameter baru (Fase 11):
+        sl_source : str — "SWING" (default) atau "SD_ZONE".
+                    Default harus "SWING" sampai validasi Fase 11.3 selesai
+                    dan disetujui eksplisit.
 
     Return:
         dict audit lengkap berisi SL, TP, RRR, audit clamp, dan status metode SL.
+        Field sl_method: "SWING" / "ATR" (perilaku lama) atau "SD_ZONE" / "ATR" (Fase 11).
     """
     # ── Resolve parameter dari Profile & Overrides ───────────────────────────
     p = RISK_PROFILES.get(profile, RISK_PROFILES["scalp_m5"])
@@ -207,51 +237,111 @@ def calculate_sl_tp(
         sl_atr = entry + (atr_multiplier * atr_value)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # LANGKAH 3: Deteksi Swing & Logika ATR Clamp
+    # LANGKAH 3: Deteksi Level SL & Logika ATR Clamp
+    # Cabang sl_source="SWING" (default) atau sl_source="SD_ZONE" (Fase 11).
     # ─────────────────────────────────────────────────────────────────────────
-    swing_raw = find_nearest_swing(df, arah, lookback=swing_lookback, wing=swing_wing)
-
     sl_swing          = None
     sl_swing_clamped  = False
     clamp_reason      = None
+    swing_raw         = None   # level raw swing (diisi saat SWING path)
+    sd_zone_info      = None   # dict zona S&D (diisi saat SD_ZONE path)
 
     min_dist = swing_clamp_min_atr * atr_value
     max_dist = swing_clamp_max_atr * atr_value
 
-    if swing_raw is not None:
-        if arah == "BUY":
-            sl_swing = swing_raw - swing_buffer
-            dist_raw = entry - sl_swing
-        else:  # SELL
-            sl_swing = swing_raw + swing_buffer
-            dist_raw = sl_swing - entry
+    if sl_source == "SD_ZONE":
+        # ── PATH S&D ZONE (Fase 11) ──────────────────────────────────────────
+        # Import di dalam fungsi untuk menghindari circular import.
+        from engine.supply_demand import find_nearest_sd_zone, DEFAULT_IMPULSIVE_RATIO  # noqa: PLC0415
 
-        # Clamp distance ke range [min_dist, max_dist]
-        if dist_raw < min_dist:
-            dist_final       = min_dist
-            sl_swing_clamped = True
-            clamp_reason     = "MIN_CAP"
-        elif dist_raw > max_dist:
-            dist_final       = max_dist
-            sl_swing_clamped = True
-            clamp_reason     = "MAX_CAP"
+        ratio = sd_impulsive_ratio if sd_impulsive_ratio is not None else DEFAULT_IMPULSIVE_RATIO
+
+        sd_zone_info = find_nearest_sd_zone(
+            df       = df,
+            arah     = arah,
+            idx      = -1,   # selalu pakai candle terakhir df (df sudah di-slice oleh caller)
+            lookback = 50,   # SD_LOOKBACK default — BELUM dikalibrasi (Fase 11)
+            impulsive_body_atr_ratio = ratio,
+            buffer   = swing_buffer,
+        )
+
+        if sd_zone_info is not None:
+            # level sudah include buffer (dihitung di find_nearest_sd_zone)
+            sl_sd_level = sd_zone_info["level"]
+
+            if arah == "BUY":
+                dist_raw = entry - sl_sd_level
+            else:  # SELL
+                dist_raw = sl_sd_level - entry
+
+            # ATR clamp IDENTIK dengan SWING path — tidak buat clamp range baru.
+            if dist_raw < min_dist:
+                dist_final       = min_dist
+                sl_swing_clamped = True
+                clamp_reason     = "MIN_CAP"
+            elif dist_raw > max_dist:
+                dist_final       = max_dist
+                sl_swing_clamped = True
+                clamp_reason     = "MAX_CAP"
+            else:
+                dist_final       = dist_raw
+                sl_swing_clamped = False
+                clamp_reason     = None
+
+            sl_method = "SD_ZONE"  # audit trail: sumber SL adalah S&D zone
+            if arah == "BUY":
+                sl_final = entry - dist_final
+            else:
+                sl_final = entry + dist_final
+
+            # sl_swing diisi dengan level zona (analogus dengan swing_raw - buffer)
+            sl_swing = sl_sd_level
         else:
-            dist_final       = dist_raw
+            # Fallback ke ATR jika tidak ada zona S&D valid ditemukan
+            dist_final       = atr_multiplier * atr_value
+            sl_final         = sl_atr
+            sl_method        = "ATR"
             sl_swing_clamped = False
             clamp_reason     = None
 
-        sl_method = "SWING"
-        if arah == "BUY":
-            sl_final = entry - dist_final
-        else:
-            sl_final = entry + dist_final
     else:
-        # Fallback ke ATR jika swing tidak ditemukan
-        dist_final       = atr_multiplier * atr_value
-        sl_final         = sl_atr
-        sl_method        = "ATR"
-        sl_swing_clamped = False
-        clamp_reason     = None
+        # ── PATH SWING (default, perilaku IDENTIK sebelum Fase 11) ───────────
+        swing_raw = find_nearest_swing(df, arah, lookback=swing_lookback, wing=swing_wing)
+
+        if swing_raw is not None:
+            if arah == "BUY":
+                sl_swing = swing_raw - swing_buffer
+                dist_raw = entry - sl_swing
+            else:  # SELL
+                sl_swing = swing_raw + swing_buffer
+                dist_raw = sl_swing - entry
+
+            # Clamp distance ke range [min_dist, max_dist]
+            if dist_raw < min_dist:
+                dist_final       = min_dist
+                sl_swing_clamped = True
+                clamp_reason     = "MIN_CAP"
+            elif dist_raw > max_dist:
+                dist_final       = max_dist
+                sl_swing_clamped = True
+                clamp_reason     = "MAX_CAP"
+            else:
+                dist_final       = dist_raw
+                sl_swing_clamped = False
+                clamp_reason     = None
+
+            sl_method = "SWING"
+            if arah == "BUY":
+                sl_final = entry - dist_final
+            else:
+                sl_final = entry + dist_final
+        else:
+            # Fallback ke ATR jika swing tidak ditemukan
+            dist_final       = atr_multiplier * atr_value
+            sl_final         = sl_atr
+            sl_method        = "ATR"
+            sl_swing_clamped = False
+            clamp_reason     = None
 
     # ─────────────────────────────────────────────────────────────────────────
     # LANGKAH 4: Hitung TP & RRR
@@ -282,12 +372,36 @@ def calculate_sl_tp(
             f"{'−' if arah == 'BUY' else '+'} buffer {swing_buffer:.2f} = {sl_final:.2f}{clamp_str} "
             f"(ATR {atr_value:.2f}, clamp range: [{min_dist:.2f}, {max_dist:.2f}])"
         )
+    elif sl_method == "SD_ZONE" and sd_zone_info is not None:
+        clamp_str = f" [CLAMPED: {clamp_reason} ({min_dist:.2f} - {max_dist:.2f} USD)]" if sl_swing_clamped else ""
+        freshness = sd_zone_info.get("freshness", "?")
+        pesan = (
+            f"SL dari S&D zone [{sd_zone_info['zone_low']:.2f}, {sd_zone_info['zone_high']:.2f}] "
+            f"({freshness}) origin_idx={sd_zone_info['origin_idx']}, "
+            f"level={sd_zone_info['level']:.2f} = {sl_final:.2f}{clamp_str} "
+            f"(ATR {atr_value:.2f}, clamp range: [{min_dist:.2f}, {max_dist:.2f}])"
+        )
     else:
+        src = "swing" if sl_source == "SWING" else "S&D zone"
         pesan = (
             f"SL dari ATR: {entry:.2f} "
             f"{'−' if arah == 'BUY' else '+'} ({atr_multiplier}×{atr_value:.2f}) = {sl_final:.2f} "
-            f"(tidak ada swing ditemukan dalam lookback {swing_lookback})"
+            f"(tidak ada {src} ditemukan dalam lookback)"
         )
+
+    # sl_swing_raw: untuk kompatibilitas backward dengan backtester (inject ke signals)
+    # Pada path SD_ZONE, kita isi dengan zone_low (BUY) atau zone_high (SELL)
+    # agar caller yang membaca sl_swing_raw untuk quality scoring tetap bisa berjalan.
+    if sl_method == "SWING":
+        sl_swing_raw_out = round(swing_raw, 2) if swing_raw is not None else None
+    elif sl_method == "SD_ZONE" and sd_zone_info is not None:
+        # Beri referensi level struktural (tanpa buffer) untuk quality scoring.
+        if arah == "BUY":
+            sl_swing_raw_out = round(sd_zone_info["zone_low"], 2)
+        else:
+            sl_swing_raw_out = round(sd_zone_info["zone_high"], 2)
+    else:
+        sl_swing_raw_out = None
 
     return {
         "valid"            : True,
@@ -303,7 +417,7 @@ def calculate_sl_tp(
         "clamp_reason"     : clamp_reason,
         "atr_value"        : round(atr_value, 2),
         "sl_atr_level"     : round(sl_atr,    2),
-        "sl_swing_raw"     : round(swing_raw, 2) if swing_raw is not None else None,
+        "sl_swing_raw"     : sl_swing_raw_out,
         "sl_swing_level"   : round(sl_swing,  2) if sl_swing  is not None else None,
         "spread"           : round(spread, 5) if spread is not None else None,
         "rrr_after_spread" : rrr_after_spread,

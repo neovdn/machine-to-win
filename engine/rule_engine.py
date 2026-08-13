@@ -61,6 +61,10 @@ from datetime import datetime, timezone
 # menjaga agar modul ini tetap bisa ditest tanpa dependensi candle_patterns.
 # (Fase 7: komponen ke-4 confidence scoring)
 
+# zone_detector diimport secara lazy di dalam _check_retest_trigger() untuk
+# menjaga konsistensi pola lazy import di modul ini.
+# (Fase 10: retest trigger menggunakan detect_consolidation_zone() secara stateless)
+
 
 # =============================================================================
 # KONSTANTA KONFIGURASI
@@ -471,6 +475,298 @@ def _check_breakout_trigger(signals: dict, zone: dict) -> dict:
 
 
 # =============================================================================
+# TRIGGER RETEST DARI ZONA KONSOLIDASI (Fase 10)
+# =============================================================================
+# Entry di titik RETEST setelah breakout terdeteksi, bukan langsung di candle
+# breakout itu sendiri. Motivasi: retest biasanya memberi level SL lebih presisi
+# (SL bisa ditempatkan lebih dekat ke level breakout) dan menyaring sebagian
+# false breakout.
+#
+# DESAIN STATELESS — tidak ada state lintas candle:
+#   Dipanggil di index manapun, menelusuri MUNDUR dari idx untuk mencari breakout
+#   event terbaru dalam window lookback, lalu mengevaluasi apakah retest sudah
+#   terjadi dan terkonfirmasi PERSIS di candle idx. Tidak ada dict/objek state
+#   yang di-pass dari candle ke candle.
+#
+# KAUSALITAS:
+#   Hanya membaca data pada dan sebelum idx. Candle setelah idx TIDAK pernah
+#   disentuh. Terbukti oleh TestRetestTriggerCausalityEndToEnd.
+#
+# REUSE KOMPONEN YANG SUDAH ADA:
+#   - detect_consolidation_zone() — parameter IDENTIK dengan backtester.py
+#     (lookback=20, max_range_atr_ratio=2.5, min_duration_candles=10).
+#   - _check_breakout_trigger()   — reuse langsung, tidak tulis ulang.
+#   - SWING_BUFFER = 0.50         — mirror dari risk_manager.py.
+#   - BODY_MIN_RATIO = 0.30       — mirror Opsi A dari candle_patterns.py.
+
+# Konstanta lokal yang di-mirror dari modul lain (zero-dependency)
+_RETEST_SWING_BUFFER   = 0.50   # Mirror SWING_BUFFER di risk_manager.py
+_RETEST_BODY_MIN_RATIO = 0.30   # Mirror threshold Opsi A di candle_patterns.py
+
+
+def _check_retest_trigger(
+    df,                                            # pd.DataFrame — kolom: high, low, close, open, atr_14
+                                                    # (volume_ratio opsional, dipakai _check_breakout_trigger)
+    idx              : int,                         # Index candle evaluasi (titik entry kandidat)
+    retest_lookback_candles : int   = 15,           # Mundur cari breakout dari idx-1
+                                                    # BELUM dikalibrasi — nilai awal struktural.
+                                                    # 15 candle = 75 menit di M5. Kalibrasi setelah
+                                                    # validasi empiris Fase 10 terbukti (Fase 11 gate).
+    retest_tolerance_atr    : float = 0.3,          # Toleransi retest touch dalam satuan ATR
+                                                    # BELUM dikalibrasi — nilai awal struktural.
+                                                    # 0.3 ATR ≈ $0.6 untuk ATR=$2.0 (M5 tipikal).
+) -> dict:
+    """
+    Evaluasi apakah candle idx adalah candle konfirmasi retest setelah breakout.
+
+    DEFINISI RETEST VALID — urutan yang harus terjadi secara temporal:
+
+        1. BREAKOUT EVENT (di candle j, j < idx):
+           - Zona konsolidasi valid di j-1 (detect_consolidation_zone)
+           - Candle j menembus zona dengan konfirmasi (_check_breakout_trigger)
+           - Menghasilkan level referensi: resistance (BUY) atau support (SELL)
+
+        2. TIDAK ADA INVALIDASI (candle m, j < m < idx):
+           - BUY:  close_m >= resistance - 0.50  (tidak kembali masuk zona)
+           - SELL: close_m <= support    + 0.50
+           - Jika ada yang melanggar → breakout invalid, cari breakout lebih lama.
+
+        3. RETEST TOUCH (candle k, j < k <= idx):
+           - BUY:  (resistance - tol) <= low_k  <= (resistance + tol)
+           - SELL: (support    - tol) <= high_k <= (support    + tol)
+           - tol = retest_tolerance_atr * atr_14_k
+
+        4. KONFIRMASI DI CANDLE IDX (harus di idx, bukan candle sebelumnya):
+           - BUY:  close_idx > resistance  AND  body_idx >= 0.30 * atr_14_idx
+           - SELL: close_idx < support     AND  body_idx >= 0.30 * atr_14_idx
+           - body_idx = abs(close_idx - open_idx)
+           - Threshold 0.30 = Opsi A dari candle_patterns.py (reuse angka).
+
+    PENCARIAN BREAKOUT (mundur dari idx):
+        Telusuri j dari idx-1 mundur sampai max(1, idx - retest_lookback_candles).
+        Breakout event PERTAMA yang valid (tidak ter-invalidasi) adalah kandidat.
+        Jika ter-invalidasi → lanjut cari breakout lebih lama.
+        Window habis tanpa breakout valid → terpenuhi=False.
+
+    CATATAN PARAMETER:
+        retest_lookback_candles=15 dan retest_tolerance_atr=0.3 adalah nilai awal
+        kalibrasi — BELUM dioptimasi via backtest. Kalibrasi dilakukan di Fase 11
+        gate check setelah edge dasarnya terbukti.
+
+    SIGNATURE BERBEDA DARI TRIGGER LAIN:
+        Trigger lain (_check_ema_trigger_m5, _check_breakout_trigger) hanya butuh
+        signals (satu titik data). Retest butuh df + idx karena menelusuri mundur
+        ke banyak candle. Ini konsisten dengan detect_consolidation_zone(df, idx).
+
+    Parameter:
+        df                      : DataFrame M5 dengan kolom high, low, close, open, atr_14.
+                                  volume_ratio opsional (untuk konfirmasi breakout).
+                                  Boleh berupa DataFrame penuh — fungsi hanya baca s/d idx.
+        idx                     : Integer index posisi candle evaluasi. Harus >= 1.
+        retest_lookback_candles : Mundur maksimum cari breakout. Default 15. BELUM dikalibrasi.
+        retest_tolerance_atr    : Toleransi touch dalam ATR. Default 0.3. BELUM dikalibrasi.
+
+    Return dict:
+        {
+            "terpenuhi"              : bool        — True jika retest confirmation valid di idx
+            "arah"                   : str         — "BUY", "SELL", atau "NETRAL"
+            "keterangan"             : str         — audit trail lengkap
+            "breakout_idx"           : int | None  — index candle breakout yang ditemukan
+            "breakout_level"         : float | None — resistance/support yang di-retest
+            "candles_since_breakout" : int | None  — idx - breakout_idx
+        }
+    """
+    # Lazy import — zone_detector tidak import dari rule_engine (tidak ada circular risk).
+    # Pola konsisten dengan lazy import session_filter dan candle_patterns di modul ini.
+    from engine.zone_detector import detect_consolidation_zone
+    import pandas as _pd
+
+    def _not_found(msg: str) -> dict:
+        """Return dict standar saat tidak ada retest ditemukan."""
+        return {
+            "terpenuhi"              : False,
+            "arah"                   : "NETRAL",
+            "keterangan"             : f"Retest Trigger: {msg}",
+            "breakout_idx"           : None,
+            "breakout_level"         : None,
+            "candles_since_breakout" : None,
+        }
+
+    # ── Validasi awal ────────────────────────────────────────────────────────
+    n = len(df)
+    if n < 2 or idx < 1 or idx >= n:
+        return _not_found(
+            f"data tidak cukup atau idx tidak valid (idx={idx}, len(df)={n})"
+        )
+
+    required_cols = {"high", "low", "close", "open", "atr_14"}
+    missing_cols  = required_cols - set(df.columns)
+    if missing_cols:
+        return _not_found(f"kolom DataFrame tidak lengkap: {sorted(missing_cols)} tidak ada")
+
+    # ── Ekstrak data candle idx (dibutuhkan untuk konfirmasi Langkah 4) ──────
+    row_idx   = df.iloc[idx]
+    close_idx = float(row_idx["close"])
+    open_idx  = float(row_idx["open"])
+    atr_idx   = float(row_idx["atr_14"])
+    body_idx  = abs(close_idx - open_idx)
+
+    # ── Batas pencarian breakout ──────────────────────────────────────────────
+    # j minimal 1 karena zone_j dihitung di j-1 (j-1 >= 0).
+    earliest_j = max(1, idx - retest_lookback_candles)
+
+    # ── Loop mundur cari breakout ─────────────────────────────────────────────
+    for j in range(idx - 1, earliest_j - 1, -1):
+
+        # ── Langkah 1a: Zona konsolidasi di j-1 (anti-circular) ───────────────
+        # Parameter IDENTIK dengan backtester.py — jangan improvisasi angka baru.
+        zone_j = detect_consolidation_zone(
+            df, idx=j - 1,
+            lookback=20,
+            max_range_atr_ratio=2.5,
+            min_duration_candles=10,
+        )
+        if not zone_j.get("is_valid", False):
+            continue  # tidak ada zona valid di titik ini
+
+        # ── Langkah 1b: Bangun signals_j dari baris j ─────────────────────────
+        row_j = df.iloc[j]
+        vr_j  = None
+        if "volume_ratio" in df.columns:
+            vr_raw = row_j.get("volume_ratio")
+            if vr_raw is not None:
+                try:
+                    vr_f = float(vr_raw)
+                    if not math.isnan(vr_f):
+                        vr_j = vr_f
+                except (TypeError, ValueError):
+                    pass
+
+        signals_j = {
+            "close"        : float(row_j["close"]),
+            "open"         : float(row_j["open"]),
+            "atr_14"       : float(row_j["atr_14"]),
+            "volume_ratio" : vr_j,
+        }
+
+        # ── Langkah 1c: Cek breakout di candle j ──────────────────────────────
+        c_bo = _check_breakout_trigger(signals_j, zone_j)
+        if not c_bo["terpenuhi"]:
+            continue  # bukan candle breakout
+
+        # Breakout ditemukan di j
+        arah_breakout = c_bo["arah"]  # "BUY" atau "SELL"
+        resistance    = float(zone_j["resistance"])
+        support       = float(zone_j["support"])
+        level_ref     = resistance if arah_breakout == "BUY" else support
+
+        # ── Langkah 2: Cek invalidasi (candle m, j < m < idx) ────────────────
+        # Jika ada close_m yang sudah kembali masuk zona melebihi SWING_BUFFER:
+        #   BUY:  close_m < resistance - 0.50 → breakout ini invalid
+        #   SELL: close_m > support    + 0.50 → breakout ini invalid
+        # Jika invalid → lanjut cari breakout yang lebih lama (j-1).
+        invalidated = False
+        for m in range(j + 1, idx):
+            close_m = float(df.iloc[m]["close"])
+            if arah_breakout == "BUY"  and close_m < resistance - _RETEST_SWING_BUFFER:
+                invalidated = True
+                break
+            if arah_breakout == "SELL" and close_m > support    + _RETEST_SWING_BUFFER:
+                invalidated = True
+                break
+
+        if invalidated:
+            continue  # breakout ini invalid — cari yang lebih lama
+
+        # ── Langkah 3: Cek retest touch (candle k, j < k <= idx) ─────────────
+        # Touch bisa di idx itu sendiri atau di candle sebelumnya dalam window.
+        # BUY:  (resistance - tol) <= low_k  <= (resistance + tol)
+        # SELL: (support    - tol) <= high_k <= (support    + tol)
+        found_touch = False
+        for k in range(j + 1, idx + 1):
+            row_k  = df.iloc[k]
+            low_k  = float(row_k["low"])
+            high_k = float(row_k["high"])
+            atr_k  = float(row_k["atr_14"])
+            tol    = retest_tolerance_atr * atr_k
+
+            if arah_breakout == "BUY":
+                if (resistance - tol) <= low_k <= (resistance + tol):
+                    found_touch = True
+                    break
+            else:  # SELL
+                if (support - tol) <= high_k <= (support + tol):
+                    found_touch = True
+                    break
+
+        if not found_touch:
+            # Breakout valid tapi belum ada retest touch — ini breakout termuda
+            # yang valid, tidak perlu cari lebih jauh ke belakang.
+            return _not_found(
+                f"breakout {arah_breakout} di candle {j} (level={level_ref:.2f}) "
+                f"ditemukan tapi BELUM ada retest touch dalam window "
+                f"(candle {j+1}\u2013{idx}) — tunggu retest"
+            )
+
+        # ── Langkah 4: Cek konfirmasi di candle idx ───────────────────────────
+        # BUY:  close_idx > resistance  AND  body_idx >= 0.30 * atr_14_idx
+        # SELL: close_idx < support     AND  body_idx >= 0.30 * atr_14_idx
+        # Threshold 0.30 = Opsi A dari candle_patterns.py (reuse angka).
+        close_ok = (
+            (arah_breakout == "BUY"  and close_idx > resistance) or
+            (arah_breakout == "SELL" and close_idx < support)
+        )
+        body_ok = (atr_idx > 0) and (body_idx >= _RETEST_BODY_MIN_RATIO * atr_idx)
+
+        if close_ok and body_ok:
+            return {
+                "terpenuhi"              : True,
+                "arah"                   : arah_breakout,
+                "keterangan"             : (
+                    f"Retest Trigger: {arah_breakout} — breakout di candle {j} "
+                    f"(level={level_ref:.2f}), retest touch terkonfirmasi, "
+                    f"candle {idx}: close={close_idx:.2f} kembali ke sisi breakout, "
+                    f"body={body_idx:.2f} >= {_RETEST_BODY_MIN_RATIO}*ATR({atr_idx:.2f})"
+                    f"={_RETEST_BODY_MIN_RATIO * atr_idx:.2f}"
+                ),
+                "breakout_idx"           : j,
+                "breakout_level"         : level_ref,
+                "candles_since_breakout" : idx - j,
+            }
+
+        # Touch ada tapi konfirmasi candle idx gagal
+        reasons = []
+        if not close_ok:
+            side = "di atas" if arah_breakout == "BUY" else "di bawah"
+            reasons.append(
+                f"close={close_idx:.2f} belum kembali {side} level={level_ref:.2f}"
+            )
+        if not body_ok:
+            reasons.append(
+                f"body={body_idx:.2f} < {_RETEST_BODY_MIN_RATIO}*ATR({atr_idx:.2f})"
+                f"={_RETEST_BODY_MIN_RATIO * atr_idx:.2f}"
+            )
+        return {
+            "terpenuhi"              : False,
+            "arah"                   : "NETRAL",
+            "keterangan"             : (
+                f"Retest Trigger: breakout {arah_breakout} di candle {j} "
+                f"(level={level_ref:.2f}), retest touch ada tapi "
+                f"konfirmasi candle {idx} gagal: {'; '.join(reasons)}"
+            ),
+            "breakout_idx"           : j,
+            "breakout_level"         : level_ref,
+            "candles_since_breakout" : idx - j,
+        }
+
+    # ── Tidak ada breakout event valid ditemukan dalam window ─────────────────
+    return _not_found(
+        f"tidak ada breakout event valid dalam lookback {retest_lookback_candles} candle "
+        f"dari idx={idx} (cek candle {earliest_j}\u2013{idx-1})"
+    )
+
+
+# =============================================================================
 # FILTER: RSI
 # =============================================================================
 # Filter berbeda dari kondisi entry — ini adalah VETO.
@@ -712,6 +1008,14 @@ def evaluate_entry(
     df                       = None,        # pd.DataFrame | None — DataFrame M5 yang di-slice hingga candle saat ini
                                             # (Fase 7) Diteruskan ke calculate_setup_quality() untuk candle pattern
                                             # detection. Default None = tidak ada candle pattern scoring.
+                                            # (Fase 10) Juga dibutuhkan oleh _check_retest_trigger() untuk
+                                            # menelusuri candle mundur secara stateless.
+    idx                      : int | None   = None,
+                                            # Index candle evaluasi di df (Fase 10).
+                                            # Dibutuhkan oleh _check_retest_trigger() untuk mencari breakout
+                                            # mundur dari posisi yang benar.
+                                            # Default None = pakai len(df)-1 jika df tersedia.
+                                            # Caller (backtester) melewatkan i (integer index loop).
     zone                     : dict | None  = None,
                                             # dict dari detect_consolidation_zone() — dihitung dari candle
                                             # SEBELUM candle ini (idx=i-1) untuk menghindari circular lookahead.
@@ -721,6 +1025,13 @@ def evaluate_entry(
                                             # True  = aktifkan breakout sebagai trigger alternatif (default).
                                             # False = nonaktifkan; dipakai untuk Tahap 0 regression check
                                             #         (sistem harus menghasilkan trade identik dengan baseline).
+    enable_retest_trigger    : bool         = False,
+                                            # Toggle retest trigger (Fase 10). Default False.
+                                            # True  = gunakan retest sebagai trigger PENGGANTI breakout immediate
+                                            #         (REPLACE, bukan tambahan). df harus tidak None.
+                                            # False = perilaku identik dengan Fase 9.
+                                            # Saat True + enable_breakout_trigger=True: breakout_trigger tetap
+                                            # dihitung (masuk kondisi_detail) tapi TIDAK menentukan trigger_valid.
 ) -> dict:
     """
     Fungsi utama rule engine — evaluasi semua kondisi dan beri keputusan akhir.
@@ -751,11 +1062,16 @@ def evaluate_entry(
         signals                 : dict dari get_latest_signals() — minimal harus punya:
                                   "trend", "trend_h1", "ema_9", "ema_21", "ema_gap_pct",
                                   "rsi_14", "close", "time"
-                                  Untuk breakout trigger juga dibutuhkan:
+                                  Untuk breakout/retest trigger juga dibutuhkan:
                                   "open", "atr_14", "volume_ratio"
         volume_mode             : str — "FILTER", "CONDITION", atau "IGNORE".
+        df                      : pd.DataFrame M5 atau None. Dipakai oleh candle pattern scoring
+                                  (Fase 7) dan retest trigger (Fase 10). None = keduanya tidak aktif.
+        idx                     : int | None — index candle evaluasi di df. Dipakai oleh retest
+                                  trigger. None = pakai len(df)-1 jika df tersedia.
         zone                    : dict dari detect_consolidation_zone() atau None.
-        enable_breakout_trigger : bool — toggle breakout trigger.
+        enable_breakout_trigger : bool — toggle breakout trigger (Fase 9).
+        enable_retest_trigger   : bool — toggle retest trigger (Fase 10). Default False.
 
     Return:
         dict berisi:
@@ -763,7 +1079,8 @@ def evaluate_entry(
             "arah"                   : "LONG" / "SHORT" / None
             "trigger_source"         : str | None — sumber trigger yang menyebabkan entry:
                                        "EMA_GAP"  = hanya EMA trigger yang cocok arah
-                                       "BREAKOUT" = hanya breakout trigger yang cocok arah
+                                       "BREAKOUT" = hanya breakout immediate yang cocok arah
+                                       "RETEST"   = hanya retest trigger yang cocok arah
                                        "BOTH"     = keduanya cocok arah (confluence)
                                        None       = WAIT (tidak ada trigger valid)
             "alasan_entry"           : list[str] — penjelasan ringkas mengapa entry
@@ -771,6 +1088,8 @@ def evaluate_entry(
             "kondisi_detail"         : dict — breakdown tiap kondisi:
                                        SELALU ada: "bias_h1", "ema_trigger_m5", "rsi_filter"
                                        Opsional  : "breakout_trigger" (jika enabled & zone ada)
+                                                   "retest_trigger" (jika enable_retest_trigger=True
+                                                                      & df tersedia)
                                                    "volume_filter" (jika volume_mode=FILTER)
             "konfirmasi_terpenuhi"   : int — jumlah trigger yang cocok arah bias_h1 (0-2)
                                        (semantik berbeda dari sebelumnya — bukan lagi hitungan
@@ -805,38 +1124,66 @@ def evaluate_entry(
     c_m5  = _check_ema_trigger_m5(signals)
     c_vol = _check_volume_participation(signals)
 
-    trigger_group = [("ema_trigger_m5", c_m5)]
     c_breakout = None  # default: tidak ada breakout trigger
+    c_retest   = None  # default: tidak ada retest trigger
 
+    # Hitung breakout trigger (jika enabled dan zone tersedia).
+    # Dihitung di kedua mode agar selalu tersedia untuk kondisi_detail / audit.
     if enable_breakout_trigger and zone is not None:
         c_breakout = _check_breakout_trigger(signals, zone)
-        trigger_group.append(("breakout_trigger", c_breakout))
 
-    # Tentukan trigger mana yang cocok arah dengan bias_h1
-    # Trigger berlawanan arah hanya diabaikan — tidak memblokir
-    ema_cocok      = c_m5["terpenuhi"] and c_m5["arah"] == arah_kandidat
-    breakout_cocok = (
-        c_breakout is not None
-        and c_breakout["terpenuhi"]
-        and c_breakout["arah"] == arah_kandidat
-    )
+    # ── Mode Retest (Fase 10) — REPLACE breakout immediate ──────────────────
+    # Ketika enable_retest_trigger=True:
+    #   trigger_group = [ema_trigger_m5, retest_trigger]
+    #   breakout_trigger TIDAK menentukan trigger_valid (mode REPLACE).
+    #   breakout_trigger tetap masuk kondisi_detail untuk audit.
+    if enable_retest_trigger and df is not None:
+        _eval_idx = idx if idx is not None else (len(df) - 1)
+        c_retest  = _check_retest_trigger(df, _eval_idx)
+        trigger_group = [("ema_trigger_m5", c_m5), ("retest_trigger", c_retest)]
 
-    trigger_valid = ema_cocok or breakout_cocok
+        ema_cocok    = c_m5["terpenuhi"]     and c_m5["arah"]     == arah_kandidat
+        retest_cocok = c_retest["terpenuhi"] and c_retest["arah"] == arah_kandidat
+        trigger_valid = ema_cocok or retest_cocok
 
-    # Tentukan trigger_source untuk audit
-    if ema_cocok and breakout_cocok:
-        trigger_source = "BOTH"
-    elif ema_cocok:
-        trigger_source = "EMA_GAP"
-    elif breakout_cocok:
-        trigger_source = "BREAKOUT"
+        # trigger_source: EMA_GAP / RETEST / BOTH (EMA+RETEST)
+        if ema_cocok and retest_cocok:
+            trigger_source = "BOTH"
+        elif ema_cocok:
+            trigger_source = "EMA_GAP"
+        elif retest_cocok:
+            trigger_source = "RETEST"
+        else:
+            trigger_source = None
+
+        konfirmasi_terpenuhi = (1 if ema_cocok else 0) + (1 if retest_cocok else 0)
+
     else:
-        trigger_source = None
+        # ── Mode Normal (Fase 9, default) — breakout immediate ───────────────
+        trigger_group = [("ema_trigger_m5", c_m5)]
+        if c_breakout is not None:
+            trigger_group.append(("breakout_trigger", c_breakout))
 
-    # Hitung konfirmasi_terpenuhi — jumlah trigger yang cocok arah bias_h1 (0, 1, atau 2)
-    # Semantik berbeda dari sebelumnya: bukan lagi hitungan kondisi_entry,
-    # tapi jumlah trigger yang secara aktif mendukung keputusan ini.
-    konfirmasi_terpenuhi = (1 if ema_cocok else 0) + (1 if breakout_cocok else 0)
+        ema_cocok      = c_m5["terpenuhi"] and c_m5["arah"] == arah_kandidat
+        breakout_cocok = (
+            c_breakout is not None
+            and c_breakout["terpenuhi"]
+            and c_breakout["arah"] == arah_kandidat
+        )
+        trigger_valid = ema_cocok or breakout_cocok
+
+        # trigger_source: EMA_GAP / BREAKOUT / BOTH (EMA+BREAKOUT)
+        if ema_cocok and breakout_cocok:
+            trigger_source = "BOTH"
+        elif ema_cocok:
+            trigger_source = "EMA_GAP"
+        elif breakout_cocok:
+            trigger_source = "BREAKOUT"
+        else:
+            trigger_source = None
+
+        konfirmasi_terpenuhi = (1 if ema_cocok else 0) + (1 if breakout_cocok else 0)
+
     konfirmasi_dibutuhkan = 1  # minimal 1 trigger valid
 
     # Volume mode CONDITION: volume bisa jadi kondisi ke-3
@@ -970,6 +1317,8 @@ def evaluate_entry(
     }
     if c_breakout is not None:
         kondisi_detail["breakout_trigger"] = c_breakout
+    if c_retest is not None:                          # Fase 10: kondisional (hanya jika retest mode aktif)
+        kondisi_detail["retest_trigger"] = c_retest
     if volume_mode == "FILTER":
         kondisi_detail["volume_filter"] = c_vol
 
@@ -1256,8 +1605,8 @@ def calculate_setup_quality(
     # Ini menangkap kekuatan gabungan trigger tanpa mengubah logika entry.
     if trigger_source == "BOTH":
         score_tconf  = 2
-        detail_tconf = f"Trigger Confluence: BOTH (EMA + Breakout searah bias H1) — konfluensi penuh"
-    elif trigger_source in ("EMA_GAP", "BREAKOUT"):
+        detail_tconf = "Trigger Confluence: BOTH (EMA + Breakout/Retest searah bias H1) — konfluensi penuh"
+    elif trigger_source in ("EMA_GAP", "BREAKOUT", "RETEST"):  # Fase 10: tambah "RETEST"
         score_tconf  = 1
         detail_tconf = f"Trigger Confluence: {trigger_source} (satu trigger aktif searah bias H1)"
     else:
@@ -1270,7 +1619,7 @@ def calculate_setup_quality(
     breakdown["trigger_confluence"] = {
         "score"          : score_tconf,
         "max"            : 2,
-        "label"          : "Trigger Confluence (EMA + Breakout)",
+        "label"          : "Trigger Confluence (EMA + Breakout/Retest)",  # Fase 10: label diperbarui
         "detail"         : detail_tconf,
         "trigger_source" : trigger_source,
     }

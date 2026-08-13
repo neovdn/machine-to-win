@@ -50,6 +50,11 @@ def run_fast_backtest(
     enable_breakout_trigger: bool = True,
                                         # Toggle breakout trigger (Fase 9).
                                         # False = untuk Tahap 0 regression check.
+    enable_retest_trigger: bool = False,
+                                        # Toggle retest trigger (Fase 10). Default False.
+                                        # Perilaku identik Fase 9 sampai diset True secara eksplisit.
+    sl_source: str = "SWING",
+    sd_impulsive_ratio: float | None = None,
 ) -> tuple:
     """
     Eksekusi backtest super cepat tanpa menghitung ulang indikator.
@@ -101,8 +106,11 @@ def run_fast_backtest(
         decision = evaluate_entry(
             signals,
             volume_mode=volume_mode,
+            df=df_m5_ind if enable_retest_trigger else None,  # Fase 10
+            idx=i         if enable_retest_trigger else None,  # Fase 10
             zone=zone,
             enable_breakout_trigger=enable_breakout_trigger,
+            enable_retest_trigger=enable_retest_trigger,       # Fase 10
         )
         if decision["keputusan"] not in ("BUY", "SELL"):
             continue
@@ -123,6 +131,8 @@ def run_fast_backtest(
                 "ask": signals["close"] + spread_pts / 2,
                 "bid": signals["close"] - spread_pts / 2,
             },
+            sl_source           = sl_source,
+            sd_impulsive_ratio  = sd_impulsive_ratio,
         )
 
         if not risk["valid"]:
@@ -202,6 +212,7 @@ def run_fast_backtest(
             "trend_h1"         : signals["trend_h1"],
             "rsi_at_entry"     : round(signals["rsi_14"], 2),
             "ema_gap_pct"      : round(signals["ema_gap_pct"], 4),
+            "trigger_source"   : decision.get("trigger_source"),  # Fase 10: RETEST/EMA_GAP/BOTH/BREAKOUT
         })
 
         in_trade_until_idx = i + candles_held

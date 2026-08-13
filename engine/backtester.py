@@ -451,6 +451,16 @@ def run_backtest(
                                         # True  = aktifkan (default).
                                         # False = nonaktifkan; dipakai untuk Tahap 0 regression check
                                         #         (trade set harus identik 100% dengan baseline).
+    enable_retest_trigger  : bool = False,
+                                        # Toggle retest trigger (Fase 10). Default False.
+                                        # True  = retest menggantikan breakout immediate (REPLACE).
+                                        # Default False: perilaku identik Fase 9, tidak mengubah
+                                        # trade set existing sampai divalidasi dan disetujui eksplisit.
+    sl_source           : str   = "SWING",
+                                        # Sumber referensi SL (Fase 11).
+                                        # "SWING" (default) = perilaku lama, identik 100%.
+                                        # "SD_ZONE" = gunakan Supply & Demand zone sebagai SL.
+                                        # Default HARUS "SWING" sampai validasi Fase 11.3 selesai.
     verbose             : bool  = True,
 ) -> tuple:
     """
@@ -576,8 +586,11 @@ def run_backtest(
         decision = evaluate_entry(
             signals,
             volume_mode=volume_mode,
+            df=df_m5_ind if enable_retest_trigger else None,  # Fase 10: dibutuhkan retest trigger
+            idx=i         if enable_retest_trigger else None,  # Fase 10: posisi candle di df
             zone=zone,
             enable_breakout_trigger=enable_breakout_trigger,
+            enable_retest_trigger=enable_retest_trigger,        # Fase 10
         )
 
         if decision["keputusan"] not in ("BUY", "SELL"):
@@ -603,6 +616,7 @@ def run_backtest(
                 "ask": signals["close"] + spread_pts / 2,
                 "bid": signals["close"] - spread_pts / 2,
             },
+            sl_source           = sl_source,   # Fase 11: passthrough
         )
 
         if not risk["valid"]:
