@@ -55,6 +55,11 @@ SWING_BUFFER        = 0.50  # Buffer dollar di luar swing (agar SL tidak persis 
 SWING_CLAMP_MIN_ATR = 0.7   # Batas minimum jarak SL terhadap ATR saat clamp
 SWING_CLAMP_MAX_ATR = 2.0   # Batas maksimum jarak SL terhadap ATR saat clamp
 
+EXTERNAL_LEVEL_BUFFER_ATR = 0.15
+# Buffer ATR-relative untuk path EXTERNAL_LEVEL (Fase 19).
+# Artinya: jarak buffer = EXTERNAL_LEVEL_BUFFER_ATR × ATR.
+# BELUM DIKALIBRASI — nilai awal struktural, bukan hasil backtest.
+
 
 # =============================================================================
 # PROFIL RISIKO (RISK PROFILES)
@@ -154,6 +159,15 @@ def calculate_sl_tp(
                                         # "SD_ZONE" → gunakan Supply & Demand zone sebagai
                                         #   referensi SL (Fase 11). Default HARUS "SWING"
                                         #   sampai divalidasi dan disetujui eksplisit.
+                                        # "EXTERNAL_LEVEL" → gunakan level SL mentah dari luar
+                                        #   (Fase 19). Level diteruskan via external_level.
+    external_level           : float | None = None,
+                                        # Level SL referensi mentah dari strategi luar (Fase 19).
+                                        # Wajib diisi ketika sl_source="EXTERNAL_LEVEL".
+                                        # None → fallback ke ATR (pola identik dengan SWING fallback).
+    external_level_buffer_atr: float | None = None,
+                                        # Override multiplier ATR buffer untuk EXTERNAL_LEVEL.
+                                        # None → pakai EXTERNAL_LEVEL_BUFFER_ATR (konstanta modul).
 ) -> dict:
     """
     Hitung SL dan TP menggunakan pendekatan ATR-Clamped Swing atau S&D Zone.
@@ -304,6 +318,56 @@ def calculate_sl_tp(
             sl_swing_clamped = False
             clamp_reason     = None
 
+    elif sl_source == "EXTERNAL_LEVEL":
+        # ── PATH EXTERNAL LEVEL (Fase 19) ─────────────────────────────────────
+        # Menerima level SL mentah dari strategi luar (range reversal, breakout
+        # retest, trend following), lalu memproses dengan buffer ATR-relative
+        # dan ATR clamp IDENTIK dengan SWING path.
+        # Logika meniru SWING path, BUKAN menulis ulang mekanisme clamp.
+
+        if external_level is not None:
+            # Hitung buffer ATR-relative (bukan dollar tetap seperti swing_buffer)
+            buf = (
+                external_level_buffer_atr
+                if external_level_buffer_atr is not None
+                else EXTERNAL_LEVEL_BUFFER_ATR
+            ) * atr_value
+
+            if arah == "BUY":
+                sl_swing = external_level - buf   # level setelah buffer
+                dist_raw = entry - sl_swing
+            else:  # SELL
+                sl_swing = external_level + buf   # level setelah buffer
+                dist_raw = sl_swing - entry
+
+            # Clamp distance ke range [min_dist, max_dist] — reuse variabel yang
+            # sudah dihitung di atas (identik dengan SWING / SD_ZONE path).
+            if dist_raw < min_dist:
+                dist_final       = min_dist
+                sl_swing_clamped = True
+                clamp_reason     = "MIN_CAP"
+            elif dist_raw > max_dist:
+                dist_final       = max_dist
+                sl_swing_clamped = True
+                clamp_reason     = "MAX_CAP"
+            else:
+                dist_final       = dist_raw
+                sl_swing_clamped = False
+                clamp_reason     = None
+
+            sl_method = "EXTERNAL_LEVEL"
+            if arah == "BUY":
+                sl_final = entry - dist_final
+            else:
+                sl_final = entry + dist_final
+        else:
+            # Fallback ke ATR jika external_level tidak diberikan
+            dist_final       = atr_multiplier * atr_value
+            sl_final         = sl_atr
+            sl_method        = "ATR"
+            sl_swing_clamped = False
+            clamp_reason     = None
+
     else:
         # ── PATH SWING (default, perilaku IDENTIK sebelum Fase 11) ───────────
         swing_raw = find_nearest_swing(df, arah, lookback=swing_lookback, wing=swing_wing)
@@ -381,8 +445,21 @@ def calculate_sl_tp(
             f"level={sd_zone_info['level']:.2f} = {sl_final:.2f}{clamp_str} "
             f"(ATR {atr_value:.2f}, clamp range: [{min_dist:.2f}, {max_dist:.2f}])"
         )
+    elif sl_method == "EXTERNAL_LEVEL" and external_level is not None:
+        clamp_str = f" [CLAMPED: {clamp_reason} ({min_dist:.2f} - {max_dist:.2f} USD)]" if sl_swing_clamped else ""
+        buf_used = (
+            external_level_buffer_atr
+            if external_level_buffer_atr is not None
+            else EXTERNAL_LEVEL_BUFFER_ATR
+        )
+        pesan = (
+            f"SL dari external level @ {external_level:.2f} "
+            f"{'−' if arah == 'BUY' else '+'} buffer {buf_used}×ATR({atr_value:.2f})={buf_used * atr_value:.2f} "
+            f"= {sl_final:.2f}{clamp_str} "
+            f"(ATR {atr_value:.2f}, clamp range: [{min_dist:.2f}, {max_dist:.2f}])"
+        )
     else:
-        src = "swing" if sl_source == "SWING" else "S&D zone"
+        src = "swing" if sl_source == "SWING" else ("S&D zone" if sl_source == "SD_ZONE" else "external level")
         pesan = (
             f"SL dari ATR: {entry:.2f} "
             f"{'−' if arah == 'BUY' else '+'} ({atr_multiplier}×{atr_value:.2f}) = {sl_final:.2f} "
@@ -400,6 +477,9 @@ def calculate_sl_tp(
             sl_swing_raw_out = round(sd_zone_info["zone_low"], 2)
         else:
             sl_swing_raw_out = round(sd_zone_info["zone_high"], 2)
+    elif sl_method == "EXTERNAL_LEVEL" and external_level is not None:
+        # Isi dengan level mentah (sebelum buffer) untuk audit trail.
+        sl_swing_raw_out = round(external_level, 2)
     else:
         sl_swing_raw_out = None
 

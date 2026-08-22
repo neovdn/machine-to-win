@@ -35,6 +35,12 @@ from engine.risk_manager import find_nearest_swing, SWING_LOOKBACK, SWING_WING
 # BELUM DIKALIBRASI
 TREND_PULLBACK_PROXIMITY_ATR = 1.0
 
+TREND_CONFIRMATION_WINDOW_M5 = 10   # candle M5 (~50 menit), BELUM DIKALIBRASI -- dipilih dari
+                                    # temuan diagnostik: 65% structure break terjadi dalam 1-9
+                                    # candle setelah pullback (sample n=17, KECIL -- perlu
+                                    # diverifikasi ulang lewat backtest volume lebih besar
+                                    # setelah revisi ini, bukan kebenaran final).
+
 
 def evaluate_trend_following(
     df_m5: pd.DataFrame,
@@ -46,19 +52,31 @@ def evaluate_trend_following(
 ) -> dict:
     """
     Evaluasi peluang entry trend following di timeframe M5.
+    
+    REVISI (pasca-diagnostik Fase 21):
+    Dari diagnostik scripts/_diag_trend_following_zero.py, terbukti bahwa 
+    pullback (setup) dan structure break (konfirmasi impulsif) adalah DUA
+    FASE BERBEDA yang tidak pernah terjadi di candle yang sama secara bersamaan
+    (co-occurrence 0%). 
+    Arsitektur diubah menjadi:
+    1. Cek konfirmasi (EMA + Structure Break) di candle SEKARANG (gerbang utama).
+    2. Jika lolos, scan MUNDUR cari pullback yang valid di dalam window 
+       beberapa candle sebelumnya (TREND_CONFIRMATION_WINDOW_M5).
     """
 
-    def _kosong(keterangan: str, d_ema=False, d_pb=False, d_pb_lvl=None, d_pb_dist=None, d_sb=False) -> dict:
+    def _kosong(keterangan: str, d_ema=False, d_sb=False) -> dict:
         return {
             "terpenuhi"             : False,
             "arah"                  : "NETRAL",
             "ema_trigger_ok"        : d_ema,
-            "pullback_ok"           : d_pb,
-            "pullback_swing_level"  : d_pb_lvl,
-            "pullback_distance"     : d_pb_dist,
+            "pullback_ok"           : False,
+            "pullback_swing_level"  : None,
+            "pullback_distance"     : None,
             "structure_break_ok"    : d_sb,
             "invalidation_level_sl" : None,
             "keterangan"            : keterangan,
+            "pullback_idx"          : None,
+            "candles_since_pullback": None,
         }
 
     # ── Langkah 1 — Tentukan arah kandidat ──────────────────────────────────
@@ -79,7 +97,8 @@ def evaluate_trend_following(
 
     row_m5 = df_m5.iloc[idx_m5]
 
-    # ── Langkah 2 — Konfirmasi EMA trigger (reuse) ──────────────────────────
+    # ── Langkah 2 — Cek KONFIRMASI (EMA + Structure Break) di candle sekarang 
+    # Cek EMA
     signals = {
         "trend"       : row_m5.get("trend"),
         "ema_9"       : row_m5.get("ema_9"),
@@ -90,31 +109,7 @@ def evaluate_trend_following(
     ema_trigger_ok = bool(c_m5["terpenuhi"] and c_m5["arah"] == arah_kandidat)
     ema_ket = "OK" if ema_trigger_ok else f"GAGAL ({c_m5['keterangan']})"
 
-    # ── Langkah 3 — Konfirmasi pullback struktural (reuse) ──────────────────
-    swing_level = find_nearest_swing(
-        df_m5.iloc[:idx_m5+1], arah=arah_kandidat, lookback=swing_lookback, wing=swing_wing
-    )
-    
-    pullback_ok = False
-    pullback_distance = None
-    pb_ket = "GAGAL (swing tidak ditemukan)"
-    
-    if swing_level is not None:
-        close_now = float(row_m5["close"])
-        atr_now   = float(row_m5["atr_14"])
-        
-        # Pengecekan lokasi (pullback proximity)
-        pullback_distance = abs(close_now - swing_level)
-        limit_dist = pullback_proximity_atr * atr_now
-        
-        if pullback_distance <= limit_dist:
-            pullback_ok = True
-            pb_ket = f"OK (dist={pullback_distance:.4f} <= limit={limit_dist:.4f})"
-        else:
-            pullback_ok = False
-            pb_ket = f"GAGAL (lokasi terlalu jauh/sudah impulsif, dist={pullback_distance:.4f} > limit={limit_dist:.4f})"
-
-    # ── Langkah 4 — Konfirmasi break of minor structure ─────────────────────
+    # Cek Structure Break
     structure_break_ok = False
     sb_ket = ""
     
@@ -136,29 +131,66 @@ def evaluate_trend_following(
             structure_break_ok = bool(close_now < min_low)
             sb_ket = f"OK (close {close_now:.4f} < min_low {min_low:.4f})" if structure_break_ok else f"GAGAL (close {close_now:.4f} >= min_low {min_low:.4f})"
 
-    # ── Langkah 5 — Gabungkan (AND semua) ───────────────────────────────────
-    terpenuhi = ema_trigger_ok and pullback_ok and structure_break_ok
-    invalidation_level_sl = swing_level if terpenuhi else None
+    # Jika konfirmasi gagal, stop disini (jangan scan pullback)
+    if not (ema_trigger_ok and structure_break_ok):
+        ket = f"Trend Following v2 {arah_kandidat} GAGAL. Konfirmasi ditolak: EMA: {ema_ket}, Structure: {sb_ket}"
+        return _kosong(ket, d_ema=ema_trigger_ok, d_sb=structure_break_ok)
+
+    # ── Langkah 3 — Scan MUNDUR cari Pullback (setup) ───────────────────────
+    scan_end = max(idx_m5 - TREND_CONFIRMATION_WINDOW_M5, 0)
     
-    if terpenuhi:
+    pullback_idx = None
+    pullback_swing_level = None
+    pullback_distance = None
+    
+    # Loop mundur dari idx_m5 - 1 sampai scan_end
+    for k in range(idx_m5 - 1, scan_end - 1, -1):
+        if k < 0:
+            break
+            
+        swing_level_k = find_nearest_swing(
+            df_m5.iloc[:k+1], arah=arah_kandidat, lookback=swing_lookback, wing=swing_wing
+        )
+        
+        if swing_level_k is not None:
+            close_k = float(df_m5["close"].iloc[k])
+            atr_k   = float(df_m5["atr_14"].iloc[k])
+            distance_k = abs(close_k - swing_level_k)
+            
+            if distance_k <= (pullback_proximity_atr * atr_k):
+                pullback_idx = k
+                pullback_swing_level = swing_level_k
+                pullback_distance = distance_k
+                break  # Berhenti di pullback yang PALING BARU (dekat idx_m5)
+
+    # ── Langkah 4 — Hasil akhir ─────────────────────────────────────────────
+    if pullback_idx is not None:
+        terpenuhi = True
+        pb_ket = f"OK (ditemukan di candle ke-{idx_m5 - pullback_idx} sblmnya, dist={pullback_distance:.4f})"
         keterangan = (
             f"Trend Following v2 {arah_kandidat} TERPENUHI. "
-            f"EMA: {ema_ket}, Pullback: {pb_ket}, Structure: {sb_ket}"
+            f"EMA: {ema_ket}, Structure: {sb_ket}, Pullback: {pb_ket}"
         )
+        invalidation_level_sl = pullback_swing_level
     else:
+        terpenuhi = False
+        pb_ket = f"GAGAL (tidak ada pullback valid dlm {TREND_CONFIRMATION_WINDOW_M5} candle sblmnya)"
         keterangan = (
             f"Trend Following v2 {arah_kandidat} GAGAL. "
-            f"EMA: {ema_ket}, Pullback: {pb_ket}, Structure: {sb_ket}"
+            f"EMA: {ema_ket}, Structure: {sb_ket}, Pullback: {pb_ket}"
         )
+        invalidation_level_sl = None
 
     return {
         "terpenuhi"             : terpenuhi,
         "arah"                  : arah_kandidat if terpenuhi else "NETRAL",
         "ema_trigger_ok"        : ema_trigger_ok,
-        "pullback_ok"           : pullback_ok,
-        "pullback_swing_level"  : swing_level,
+        "pullback_ok"           : (pullback_idx is not None),
+        "pullback_swing_level"  : pullback_swing_level,
         "pullback_distance"     : pullback_distance,
         "structure_break_ok"    : structure_break_ok,
         "invalidation_level_sl" : invalidation_level_sl,
         "keterangan"            : keterangan,
+        "pullback_idx"          : pullback_idx,
+        "candles_since_pullback": (idx_m5 - pullback_idx) if pullback_idx is not None else None,
     }
